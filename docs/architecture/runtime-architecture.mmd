@@ -1,0 +1,25 @@
+flowchart LR
+  Dev[Developer or CI] --> Launch[rosetta run]
+  Launch --> Detect[Detect or receive harness]
+  Detect --> Locate[Locate .rosettai manifest]
+  Locate --> Validate[Validate canonical model]
+  Validate --> Resolve[Resolve profiles, overlays and secrets refs]
+  Resolve --> Adapter{Target adapter}
+  Adapter --> Claude[Claude Code projection]
+  Adapter --> OpenCode[OpenCode projection]
+  Adapter --> Copilot[GitHub Copilot projection]
+  Claude --> Cache[Content-addressed local runtime cache]
+  OpenCode --> Cache
+  Copilot --> Cache
+  Cache --> Report[Provenance and capability report]
+  Report --> Execute[Launch selected harness]
+
+  subgraph Repository [Versioned repository]
+    Canonical[.rosettai canonical resources]
+  end
+  Canonical --> Locate
+
+  subgraph Local [Ignored local state]
+    Cache
+    Report
+  end

@@ -1,0 +1,14 @@
+flowchart TB
+  Source[.rosettai resources] --> IR[Validated canonical IR]
+  IR --> Cap[Capability negotiation]
+  Cap --> Strict{Strict mode?}
+  Strict -->|Unsupported| Fail[Fail with actionable report]
+  Strict -->|Supported| Compile[Adapter compilation]
+  Cap -->|Compatible mode| Warn[Emit warnings and transformations]
+  Warn --> Compile
+  Compile --> Owned[Owned generated cache files]
+  Owned --> Verify[Hash and provenance verification]
+  Verify --> Run[Harness process]
+
+  Secret[Environment or secret provider] --> Resolve[Resolve secret references]
+  Resolve --> Compile

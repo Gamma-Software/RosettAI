@@ -1,0 +1,25 @@
+flowchart LR
+  Login[Windows sign-in] --> Guardian[RosettAI Guardian<br/>per-user process]
+  Guardian --> Discover[Discover supported installed harnesses]
+  Discover --> Map[Resolve supported global bootstrap location]
+  Map --> Check{RosettAI marker<br/>and hash valid?}
+  Check -->|Yes| Monitor[Record healthy state]
+  Check -->|No, policy allows| Repair[Install or repair owned bootstrap]
+  Check -->|No, consent required| Alert[Report actionable drift]
+  Repair --> Monitor
+  Monitor --> Tick[Periodic bounded check]
+  Tick --> Discover
+
+  Agent[Agent opens repository] --> Bootstrap[Harness global bootstrap]
+  Bootstrap --> Canonical{RosettAI manifest found?}
+  Canonical -->|No| Continue[Normal behavior]
+  Canonical -->|Yes| Status[Run rosetta status]
+  Status --> Active{Compatible projection active?}
+  Active -->|Yes| Continue
+  Active -->|No| Warning[Visible RosettAI warning]
+
+  subgraph LocalState [Local and ignored]
+    Guardian
+    Monitor
+    Alert
+  end
