@@ -13,7 +13,7 @@ flowchart LR
   Agent[Agent opens repository] --> Bootstrap[Harness global bootstrap]
   Bootstrap --> Canonical{RosettAI manifest found?}
   Canonical -->|No| Continue[Normal behavior]
-  Canonical -->|Yes| Status[Run rosetta status]
+  Canonical -->|Yes| Status[Run rai status]
   Status --> Active{Compatible projection active?}
   Active -->|Yes| Continue
   Active -->|No| Warning[Visible RosettAI warning]

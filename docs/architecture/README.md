@@ -12,7 +12,7 @@ RosettAI is a harness-neutral source of truth for AI-agent configuration. Reposi
 ## Non-goals
 
 - Replacing harnesses or masking their native capabilities.
-- Reliably intercepting arbitrary direct agent launches; `rosetta run` is the dependable pre-launch path.
+- Reliably intercepting arbitrary direct agent launches; `rai run` is the dependable pre-launch path.
 - Pretending a closed or unsupported harness is managed.
 
 ## Architecture
@@ -34,6 +34,6 @@ The proposed per-user Windows Guardian starts at sign-in, discovers supported ha
 
 1. Schema, validator, and dry-run report.
 2. Read-only compiler with Claude Code, OpenCode, and GitHub Copilot adapters.
-3. Explicit `rosetta run` launcher.
+3. Explicit `rai run` launcher.
 4. Migration tooling for existing harness configuration.
 5. Local Guardian for bootstrap verification and repair.

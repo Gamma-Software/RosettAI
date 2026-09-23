@@ -65,7 +65,7 @@ Generated locations are ignored, not canonical:
 
 ## Runtime model
 
-1. A launcher (`rosetta run <harness> [args...]`) receives an explicit harness, or identifies it from the invoked command / environment.
+1. A launcher (`rai run <harness> [args...]`) receives an explicit harness, or identifies it from the invoked command / environment.
 2. It locates `.rosettai/manifest.yaml` by walking upward from the working directory.
 3. It validates the canonical configuration and resolves inheritance, profiles, and overlays.
 4. The adapter compiles a harness projection into a content-addressed local cache, e.g. `.rosettai/.runtime/<hash>/<harness>/`.
@@ -80,10 +80,10 @@ RosettAI installs a **per-user Windows Guardian**, started at sign-in and runnin
 ### Responsibilities
 
 1. Discover installed supported harnesses from deterministic locations (known executables, package-manager registrations, and supported configuration roots); never infer a harness from arbitrary running processes.
-2. Install or repair a small, RosettAI-owned global bootstrap instruction for each detected harness. The bootstrap says that a repository may contain `.rosettai/`, asks the agent to run `rosetta status`, and requires a visible warning when canonical configuration exists but no compatible projection is active.
+2. Install or repair a small, RosettAI-owned global bootstrap instruction for each detected harness. The bootstrap says that a repository may contain `.rosettai/`, asks the agent to run `rai status`, and requires a visible warning when canonical configuration exists but no compatible projection is active.
 3. Check the bootstrap hash periodically and after harness installation/update. If it was edited or removed, report drift and repair only with the user-approved policy.
 4. Maintain local state, logs, and an audit trail under `%LOCALAPPDATA%\RosettAI\`; no guardian state belongs in repositories.
-5. Offer `rosetta guardian status`, `repair`, `pause`, and `uninstall`. All writes are limited to explicit RosettAI ownership markers.
+5. Offer `rai guardian status`, `repair`, `pause`, and `uninstall`. All writes are limited to explicit RosettAI ownership markers.
 
 ### Lifecycle
 
@@ -103,7 +103,7 @@ The recommended deployment is a user-level startup registration (for example, Ta
 The bootstrap is intentionally short, generic, and non-secret. It must:
 
 - detect `.rosettai/manifest.yaml` by walking upward from the active workspace;
-- call `rosetta status --harness <current-harness>` when available;
+- call `rai status --harness <current-harness>` when available;
 - warn the user if canonical resources are newer or not projected for that harness;
 - never overwrite repository files, auto-run untrusted hooks, or expose secrets;
 - clearly identify the warning as RosettAI-generated.
@@ -140,7 +140,7 @@ An unsupported feature fails in `strict` mode and yields a warning in `compatibl
 - Generated state is excluded from Git and is content-addressed.
 - A lock/provenance file records exact sources, adapter version, template version, target harness version, and output hashes.
 - Launch occurs only after a successful compilation; a failed compilation leaves the prior cache intact.
-- `rosetta doctor` reports collisions, unsupported resources, unresolved secrets, and stale caches.
+- `rai doctor` reports collisions, unsupported resources, unresolved secrets, and stale caches.
 
 ## Migration from the HarnessTap experiment
 
@@ -159,7 +159,7 @@ Then adapters generate each harness projection locally. Git tracks only `.rosett
 
 1. **Schema and validator** — manifest, resource discovery, ownership rules, dry-run report.
 2. **Read-only compiler** — Claude Code, OpenCode, and GitHub Copilot adapters producing cache files and provenance.
-3. **Launcher** — explicit `rosetta run`, then safe auto-detection for supported commands.
+3. **Launcher** — explicit `rai run`, then safe auto-detection for supported commands.
 4. **Migration** — import existing harness files into canonical resources, with reviewable diffs.
 5. **Local Guardian** — per-user Windows startup, harness discovery, global bootstrap ownership, drift reporting, and repair controls.
 6. **Advanced policy** — MCP secret providers, hook trust, profiles, remote bundles, and team governance.
