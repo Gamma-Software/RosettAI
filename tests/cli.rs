@@ -21,6 +21,44 @@ fn invoke_cursor_hook(repo: &std::path::Path) -> std::process::Output {
     child.wait_with_output().unwrap()
 }
 
+fn invoke_codex_hook(repo: &std::path::Path) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["sync", "--codex-hook", "--repo"])
+        .arg(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(br#"{"prompt":"test"}"#)
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn codex_hook_blocks_after_sync_then_allows_next_prompt() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
+    fs::write(
+        repo.path().join(".agents/rules/general.md"),
+        "Use the test convention.\n",
+    )
+    .unwrap();
+    fs::write(repo.path().join(".agents/codex.json"), "{}").unwrap();
+    let first = invoke_codex_hook(repo.path());
+    assert!(first.status.success());
+    assert!(String::from_utf8_lossy(&first.stdout).contains("\"decision\":\"block\""));
+    assert!(repo.path().join("AGENTS.md").exists());
+    let second = invoke_codex_hook(repo.path());
+    assert_eq!(
+        String::from_utf8_lossy(&second.stdout).trim(),
+        "{\"continue\":true}"
+    );
+}
+
 fn assert_time_taken(stderr: &[u8]) {
     let output = String::from_utf8_lossy(stderr);
     let line = output

@@ -5,11 +5,13 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod codex;
 mod perf;
 mod setup;
 
 const CLAUDE: &str = "CLAUDE.md";
 const CURSOR: &str = ".cursor/rules/rosettai.mdc";
+const CODEX: &str = "AGENTS.md";
 const IGNORE_START: &str = "# RosettAI generated files";
 const IGNORE_END: &str = "# End RosettAI generated files";
 const CURSOR_FRONTMATTER: &str =
@@ -20,6 +22,7 @@ const MARKER_START: &str = "<!-- rai-generated sha256:";
 enum Action {
     Create,
     Update,
+    Delete,
     Unchanged,
 }
 
@@ -55,6 +58,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let mut json = false;
     let mut perf = false;
     let mut cursor_hook = false;
+    let mut codex_hook = false;
     let mut repo = None;
     let mut roots = Vec::new();
     while let Some(arg) = args.next() {
@@ -63,6 +67,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--json" => json = true,
             "--perf" => perf = true,
             "--cursor-hook" => cursor_hook = true,
+            "--codex-hook" => codex_hook = true,
             "--repo" => repo = Some(PathBuf::from(args.next().ok_or("--repo needs a path")?)),
             "--root" => roots.push(PathBuf::from(args.next().ok_or("--root needs a path")?)),
             _ => return Err(format!("unknown option: {arg}")),
@@ -79,6 +84,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
     if cursor_hook && command != "sync" {
         return Err("--cursor-hook is only valid with sync".into());
+    }
+    if codex_hook && command != "sync" {
+        return Err("--codex-hook is only valid with sync".into());
+    }
+    if codex_hook && (cursor_hook || dry_run || json) {
+        return Err(
+            "--codex-hook cannot be combined with --cursor-hook, --dry-run or --json".into(),
+        );
     }
     if cursor_hook && (dry_run || json) {
         return Err("--cursor-hook cannot be combined with --dry-run or --json".into());
@@ -99,14 +112,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if command == "init" {
         return init(&start);
     }
-    let root = if cursor_hook {
+    let root = if cursor_hook || codex_hook {
         match find_repo(&start) {
             Ok(root) => root,
             Err(error) => {
-                print_cursor_hook_result(
-                    false,
-                    &format!("RosettAI cannot check this prompt: {error}"),
-                );
+                if codex_hook {
+                    print_codex_hook_result(&format!("RosettAI cannot check this prompt: {error}"));
+                } else {
+                    print_cursor_hook_result(
+                        false,
+                        &format!("RosettAI cannot check this prompt: {error}"),
+                    );
+                }
                 return Ok(());
             }
         }
@@ -120,6 +137,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     };
     match command.as_str() {
         "sync" if cursor_hook => sync_cursor_hook(&root),
+        "sync" if codex_hook => sync_codex_hook(&root),
         "sync" => sync_with_format(&root, dry_run, json),
         "status" => status(&root, json),
         "doctor" => doctor(&root, json),
@@ -128,7 +146,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: rai <setup|init|status|sync|doctor> [--repo PATH] [--root PATH] [--dry-run] [--json] [--cursor-hook] [--perf]"
+    "usage: rai <setup|init|status|sync|doctor> [--repo PATH] [--root PATH] [--dry-run] [--json] [--cursor-hook] [--codex-hook] [--perf]"
         .into()
 }
 
@@ -203,6 +221,10 @@ fn apply_changes(changes: Vec<Change>) -> Result<(), String> {
         if change.action == Action::Unchanged {
             continue;
         }
+        if change.action == Action::Delete {
+            fs::remove_file(&change.path).map_err(|e| format!("{}: {e}", change.path.display()))?;
+            continue;
+        }
         if let Some(parent) = change.path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
@@ -272,19 +294,77 @@ fn print_cursor_hook_result(continue_prompt: bool, message: &str) {
     );
 }
 
+fn sync_codex_hook(root: &Path) -> Result<(), String> {
+    let mut input = String::new();
+    io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|e| e.to_string())?;
+    let changes = match plan_sync(root) {
+        Ok(changes) => changes,
+        Err(error) => {
+            print_codex_hook_result(&format!("RosettAI synchronization is blocked: {error}"));
+            return Ok(());
+        }
+    };
+    if changes
+        .iter()
+        .all(|change| change.action == Action::Unchanged)
+    {
+        println!("{{\"continue\":true}}");
+        return Ok(());
+    }
+    let paths = changes
+        .iter()
+        .filter(|change| change.action != Action::Unchanged)
+        .map(|change| {
+            change
+                .path
+                .strip_prefix(root)
+                .unwrap()
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    match apply_changes(changes) {
+        Ok(()) => print_codex_hook_result(&format!(
+            "RosettAI synchronized {paths}. Resubmit the prompt in a new Codex session so instructions and MCP config reload."
+        )),
+        Err(error) => print_codex_hook_result(&format!("RosettAI synchronization failed: {error}")),
+    }
+    Ok(())
+}
+
+fn print_codex_hook_result(message: &str) {
+    println!(
+        "{{\"decision\":\"block\",\"reason\":{}}}",
+        json_string(message)
+    );
+}
+
 fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
     let rules = read_rules(&root.join(".agents/rules"))?;
     let body = format!("# Shared project rules\n\n{rules}");
-    let outputs = [
-        (CLAUDE, owned(&body, "")),
-        (CURSOR, owned(&body, CURSOR_FRONTMATTER)),
-    ];
+    let codex_enabled = codex::enabled(root)?;
+    let mut outputs = vec![(CLAUDE.to_string(), owned(&body, ""), "".to_string())];
+    outputs.push((
+        CURSOR.to_string(),
+        owned(&body, CURSOR_FRONTMATTER),
+        CURSOR_FRONTMATTER.to_string(),
+    ));
+    if codex_enabled {
+        codex::check_version()?;
+        outputs.push((CODEX.to_string(), owned(&body, ""), "".to_string()));
+        for (path, body) in codex::outputs(root)? {
+            outputs.push((path, owned_comment(&body), "#".to_string()));
+        }
+    }
 
     // Plan every write before applying any of them. A single collision aborts the sync.
     let mut changes = Vec::new();
-    for (relative, content) in outputs {
-        let path = root.join(relative);
-        if is_tracked(root, relative)? {
+    for (relative, content, marker) in outputs {
+        let path = root.join(&relative);
+        if is_tracked(root, &relative)? {
             return Err(format!(
                 "tracked output conflict: {relative}; remove it from Git tracking first"
             ));
@@ -299,14 +379,12 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         let action = if path.exists() {
             let current =
                 fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            if !is_owned(
-                &current,
-                if relative == CURSOR {
-                    CURSOR_FRONTMATTER
-                } else {
-                    ""
-                },
-            ) {
+            let valid = if marker == "#" {
+                is_owned_comment(&current)
+            } else {
+                is_owned(&current, &marker)
+            };
+            if !valid {
                 return Err(format!("unowned or modified output conflict: {relative}"));
             }
             if current == content {
@@ -324,6 +402,38 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         });
     }
 
+    if codex_enabled {
+        let agents_dir = root.join(".codex/agents");
+        if agents_dir.is_dir() {
+            for entry in fs::read_dir(&agents_dir).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                if path.is_symlink() {
+                    return Err(format!("symlink output conflict: {}", path.display()));
+                }
+                if path.extension().is_some_and(|ext| ext == "toml")
+                    && !changes.iter().any(|c| c.path == path)
+                {
+                    let relative = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    if is_tracked(root, &relative)? {
+                        continue;
+                    }
+                    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                    if is_owned_comment(&content) {
+                        changes.push(Change {
+                            path,
+                            content: String::new(),
+                            action: Action::Delete,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     let ignore_path = root.join(".gitignore");
     if ignore_path.is_symlink() {
         return Err("symlink output conflict: .gitignore".into());
@@ -333,7 +443,13 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
     } else {
         String::new()
     };
-    let new_ignore = update_ignore(&old_ignore)?;
+    let paths = changes
+        .iter()
+        .filter(|change| change.action != Action::Delete)
+        .filter_map(|change| change.path.strip_prefix(root).ok())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let new_ignore = update_ignore_paths(&old_ignore, &paths)?;
     let ignore_action = if old_ignore == new_ignore {
         Action::Unchanged
     } else if ignore_path.exists() {
@@ -451,7 +567,11 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
             fix: Some(DoctorFix::Sync),
         });
     }
-    if root.join("AGENTS.md").exists() {
+    if root.join("AGENTS.md").exists()
+        && !fs::read_to_string(root.join("AGENTS.md"))
+            .ok()
+            .is_some_and(|s| is_owned(&s, ""))
+    {
         issues.push(DoctorIssue {
             message: "unmanaged AGENTS.md exists".into(),
             solution: "Review and copy its instructions into .agents/rules/, then remove or relocate AGENTS.md after confirming the new source. Automatic import is not implemented.".into(),
@@ -669,6 +789,7 @@ fn print_changes_array(root: &Path, changes: &[Change]) {
         let action = match change.action {
             Action::Create => "create",
             Action::Update => "update",
+            Action::Delete => "delete",
             Action::Unchanged => "unchanged",
         };
         print!(
@@ -751,6 +872,21 @@ fn is_owned(content: &str, prefix: &str) -> bool {
     hash.len() == 64 && hash == format!("{:x}", Sha256::digest(body.as_bytes()))
 }
 
+fn owned_comment(body: &str) -> String {
+    let hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+    format!("# rai-generated sha256:{hash}\n{body}")
+}
+
+fn is_owned_comment(content: &str) -> bool {
+    let Some(rest) = content.strip_prefix("# rai-generated sha256:") else {
+        return false;
+    };
+    let Some((hash, body)) = rest.split_once('\n') else {
+        return false;
+    };
+    hash.len() == 64 && hash == format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
 fn is_tracked(root: &Path, path: &str) -> Result<bool, String> {
     let output = Command::new("git")
         .args(["ls-files", "--error-unmatch", "--", path])
@@ -765,8 +901,13 @@ fn is_tracked(root: &Path, path: &str) -> Result<bool, String> {
     }
 }
 
-fn update_ignore(old: &str) -> Result<String, String> {
-    let block = format!("{IGNORE_START}\n/{CLAUDE}\n/{CURSOR}\n{IGNORE_END}\n");
+fn update_ignore_paths(old: &str, paths: &[String]) -> Result<String, String> {
+    let entries = paths
+        .iter()
+        .filter(|p| p.as_str() != ".gitignore")
+        .map(|p| format!("/{p}\n"))
+        .collect::<String>();
+    let block = format!("{IGNORE_START}\n{entries}{IGNORE_END}\n");
     match (old.find(IGNORE_START), old.find(IGNORE_END)) {
         (None, None) => {
             let mut updated = old.to_owned();
@@ -825,6 +966,98 @@ mod tests {
             fs::read_to_string(dir.path().join(".gitignore")).unwrap()
         );
         assert_eq!(ignore.matches(IGNORE_START).count(), 1);
+    }
+
+    #[test]
+    fn codex_projection_converts_rules_mcp_agents_and_preserves_skills() {
+        let dir = repo();
+        fs::write(dir.path().join(".agents/codex.json"), "{}\n").unwrap();
+        fs::write(dir.path().join(".agents/mcp.json"), r#"{"servers":{"docs":{"transport":"http","url":"https://example.com/mcp","bearer_token_env_var":"DOCS_TOKEN"},"local":{"transport":"stdio","command":"npx","args":["-y","example-mcp"],"env_vars":["LOCAL_TOKEN"]}}}"#).unwrap();
+        fs::create_dir_all(dir.path().join(".agents/agents")).unwrap();
+        fs::write(dir.path().join(".agents/agents/reviewer.json"), r#"{"name":"reviewer","description":"Reviews changes","developer_instructions":"Check tests and risks."}"#).unwrap();
+        fs::create_dir_all(dir.path().join(".agents/skills/checks")).unwrap();
+        fs::write(
+            dir.path().join(".agents/skills/checks/SKILL.md"),
+            "---\nname: checks\ndescription: Check changes.\n---\n\nRun tests.\n",
+        )
+        .unwrap();
+        sync(dir.path(), false).unwrap();
+        let agents = fs::read_to_string(dir.path().join(CODEX)).unwrap();
+        let config = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        let custom = fs::read_to_string(dir.path().join(".codex/agents/reviewer.toml")).unwrap();
+        assert!(agents.contains("Prefer clear names."));
+        assert!(config.contains("[mcp_servers.docs]"));
+        assert!(config.contains("[mcp_servers.local]"));
+        assert!(config.contains("[[hooks.UserPromptSubmit]]"));
+        let parsed: toml::Value = config.parse().unwrap();
+        assert_eq!(
+            parsed["mcp_servers"]["docs"]["url"].as_str(),
+            Some("https://example.com/mcp")
+        );
+        assert_eq!(
+            parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
+            Some("rai sync --codex-hook")
+        );
+        assert!(custom.contains("Check tests and risks."));
+        assert!(dir.path().join(".agents/skills/checks/SKILL.md").exists());
+        assert!(is_owned(&agents, ""));
+        assert!(is_owned_comment(&config));
+        assert!(is_owned_comment(&custom));
+        assert_eq!(
+            plan_sync(dir.path())
+                .unwrap()
+                .iter()
+                .filter(|c| c.action != Action::Unchanged)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn codex_version_parser_and_gate() {
+        assert_eq!(
+            codex::parse_version("codex-cli 0.152.1\n").unwrap(),
+            (0, 152, 1)
+        );
+        assert_eq!(
+            codex::parse_version("codex-cli 0.153.0-beta.1").unwrap(),
+            (0, 153, 0)
+        );
+        assert!(codex::parse_version("other 0.152.1").is_err());
+    }
+
+    #[test]
+    fn codex_unowned_agents_file_aborts() {
+        let dir = repo();
+        fs::write(dir.path().join(".agents/codex.json"), "{}").unwrap();
+        fs::write(dir.path().join(CODEX), "User rules\n").unwrap();
+        assert!(sync(dir.path(), false).unwrap_err().contains("unowned"));
+        assert!(!dir.path().join(".codex/config.toml").exists());
+    }
+
+    #[test]
+    fn deleted_canonical_subagent_removes_only_owned_projection() {
+        let dir = repo();
+        fs::write(dir.path().join(".agents/codex.json"), "{}").unwrap();
+        fs::create_dir_all(dir.path().join(".agents/agents")).unwrap();
+        let source = dir.path().join(".agents/agents/reviewer.json");
+        fs::write(
+            &source,
+            r#"{"name":"reviewer","description":"Review","developer_instructions":"Check tests."}"#,
+        )
+        .unwrap();
+        sync(dir.path(), false).unwrap();
+        let projection = dir.path().join(".codex/agents/reviewer.toml");
+        assert!(projection.exists());
+        fs::remove_file(source).unwrap();
+        assert!(
+            plan_sync(dir.path())
+                .unwrap()
+                .iter()
+                .any(|c| c.path == projection && c.action == Action::Delete)
+        );
+        sync(dir.path(), false).unwrap();
+        assert!(!projection.exists());
     }
 
     #[test]

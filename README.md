@@ -2,7 +2,7 @@
 
 RosettAI helps teams share AI coding agent configuration without requiring every developer to use the same harness. MCP and Skills provide some common ground, but rules, plugins, hooks, and other harness settings still differ between tools. RosettAI aims to let a team define its intent once, then generate configuration for each supported harness and explain any differences.
 
-The project is in an early proof-of-concept phase. The Rust CLI implements `setup`, `init`, `status`, `sync`, and `doctor` for global Markdown rules. Scoped rules, native-file migration, and harness detection remain design proposals.
+The project is in an early proof-of-concept phase. The Rust CLI implements `setup`, `init`, `status`, `sync`, and `doctor` for global Markdown rules, plus an opt-in Codex adapter for MCP and custom agents. Scoped rules, native-file migration, and harness detection remain design proposals.
 
 ## Product values
 
@@ -26,7 +26,7 @@ cargo run -- sync --repo /path/to/test-repo
 cargo test
 ```
 
-The command generates `CLAUDE.md` and `.cursor/rules/rosettai.mdc`, and adds exact output paths to the repository-root `.gitignore`. It refuses to replace existing unowned, modified, or Git-tracked outputs. This POC does not yet detect installed harnesses: it always projects to both formats. It also does not support scoped rules or native-file migration. Use a test repository; existing native files will cause a reported conflict rather than being imported.
+By default the command generates `CLAUDE.md` and `.cursor/rules/rosettai.mdc`, and adds exact output paths to the repository-root `.gitignore`. Add `.agents/codex.json` containing `{}` for the [Codex adapter](docs/codex.md): it also generates `AGENTS.md`, `.codex/config.toml`, and custom subagents while using canonical skills in place. It refuses to replace existing unowned, modified, or Git-tracked outputs. This POC does not yet detect installed harnesses or support scoped rules and native-file migration. Use a test repository; existing native files will cause a reported conflict rather than being imported.
 
 Run `cargo install --path .` to put `rai` on your `PATH`. Then `rai init` creates a starter `.agents/rules/general.md`, `rai status` previews drift, and `rai doctor` reports configuration problems. `rai setup --root /path/to/workspace` registers a workspace for polling and, on macOS, installs a per-user launchd watcher. It also configures Git hooks for future clones when no global hook path or custom template directory is already configured. Setup is not run automatically by installation. On other platforms, run the internal `rai watch` process manually for now.
 

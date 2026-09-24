@@ -10,7 +10,7 @@ The proposed command interface is specified in [`cli.md`](cli.md).
 
 ## One source in `.agents/`
 
-The team writes and versions its rules, Skills, hooks, plugins, and harness preferences under `.agents/`. RosettAI reads that directory as the source of truth. The current POC projects global rules to `CLAUDE.md` and `.cursor/rules/rosettai.mdc` regardless of which harnesses are installed. Detecting installed harnesses and producing `AGENTS.md`, `.opencode/`, or `.codex/` files remain future work.
+The team writes and versions its rules, Skills, hooks, plugins, and harness preferences under `.agents/`. RosettAI reads that directory as the source of truth. By default the POC projects global rules to `CLAUDE.md` and `.cursor/rules/rosettai.mdc`. An opt-in [Codex adapter](codex.md) also projects `AGENTS.md`, MCP configuration and subagents; Codex reads canonical skills directly. Detecting installed harnesses and producing `.opencode/` files remain future work.
 
 After a normal Git clone, a locally installed RosettAI watcher can discover repositories containing `.agents/`, synchronize their projections, and check again when the source changes. The CLI is named `rai` (short for RosettAI): `rai setup` installs the local synchronizer once, while `rai sync` and `rai status` are available on demand. Future harness detection must not imply that every source feature can be translated; unsupported behavior must be reported.
 
