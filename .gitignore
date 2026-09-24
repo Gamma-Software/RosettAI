@@ -1,1 +1,6 @@
 .DS_Store
+/target/
+# RosettAI generated files
+/CLAUDE.md
+/.cursor/rules/rosettai.mdc
+# End RosettAI generated files

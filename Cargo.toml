@@ -1,0 +1,12 @@
+[package]
+name = "rai"
+version = "0.1.0"
+edition = "2024"
+description = "RosettAI proof of concept: project rules to native harness files"
+license = "MIT"
+
+[dependencies]
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
