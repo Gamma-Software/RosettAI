@@ -2,15 +2,15 @@
 
 ## Purpose
 
-Developers should be free to use different AI coding harnesses in the same repository. RosettAI is the translation layer between one shared configuration and the native formats required by each installed harness.
+The current RosettAI implementation targets Codex only. Supporting other AI coding harnesses remains a product direction, not a current CLI capability.
 
-This document records the current design direction. A limited Rust CLI now implements `setup`, `init`, `status`, `sync`, and `doctor` for global Markdown rules. Setup can install a macOS polling watcher and Git hooks for future clones; scoped rules, native-file migration, and harness detection are not implemented. Where older architecture documents specify `.rosettai/` as the canonical directory or `rai run` as the primary activation path, this document supersedes those choices.
+This document records the current design direction. A limited Rust CLI now implements `setup`, `init`, `status`, `sync`, and `doctor` for global and directory-scoped Markdown rules. Setup can install a macOS polling watcher and Git hooks for future clones; native-file migration and harness detection are not implemented. Where older architecture documents specify `.rosettai/` as the canonical directory or `rai run` as the primary activation path, this document supersedes those choices.
 
 The proposed command interface is specified in [`cli.md`](cli.md).
 
 ## One source in `.agents/`
 
-The team writes and versions its rules, Skills, hooks, plugins, and harness preferences under `.agents/`. RosettAI reads that directory as the source of truth. By default the POC projects global rules to `CLAUDE.md` and `.cursor/rules/rosettai.mdc`. An opt-in [Codex adapter](codex.md) also projects `AGENTS.md`, MCP configuration and subagents; Codex reads canonical skills directly. Detecting installed harnesses and producing `.opencode/` files remain future work.
+The team writes and versions its rules, YAML subagents, Skills and MCP servers under `.agents/`. RosettAI reads that directory as the source of truth. The [Codex adapter](codex.md) projects rules into `AGENTS.md`, YAML subagents into `.codex/agents/*.toml`, projects MCP configuration, and lets Codex read canonical skills directly. Other harness adapters remain future work.
 
 After a normal Git clone, a locally installed RosettAI watcher can discover repositories containing `.agents/`, synchronize their projections, and check again when the source changes. The CLI is named `rai` (short for RosettAI): `rai setup` installs the local synchronizer once, while `rai sync` and `rai status` are available on demand. Future harness detection must not imply that every source feature can be translated; unsupported behavior must be reported.
 
@@ -29,17 +29,17 @@ RosettAI checks the repository-root `.gitignore` before writing a projection. If
 
 ```gitignore
 # RosettAI generated files
-/CLAUDE.md
-/.cursor/rules/rosettai.mdc
+/AGENTS.md
+/.codex/config.toml
 # End RosettAI generated files
 ```
 
-Do not ignore an entire native directory such as `/.claude/` or `/.github/` merely because RosettAI writes one file there: the repository may contain hand-maintained files alongside generated ones. If a proposed output path already exists and is not owned by RosettAI, import it first when it is a supported native rule; otherwise report a conflict before writing. If Git already tracks that path, adding an ignore rule will not untrack it; report the tracked-output conflict.
+Do not ignore the entire `/.codex/` directory merely because RosettAI writes files there: the repository may contain hand-maintained files alongside generated ones. If a proposed output path already exists and is not owned by RosettAI, report a conflict before writing. If Git already tracks that path, adding an ignore rule will not untrack it; report the tracked-output conflict.
 
 RosettAI should record which paths it owns so later syncs can update or remove only its own outputs. `rai status` should show detected harnesses, generated paths, conflicts, and unsupported features.
 
 ## Native configuration drift
 
-Every sync scans supported native instruction locations, including `CLAUDE.md` and `AGENTS.md` files in repository subdirectories. A file that RosettAI did not generate is an import candidate, even if it is ignored by Git. For example, `frontend/CLAUDE.md` may contain rules that belong in `.agents/rules/frontend.md`; its original directory scope must be preserved.
+Sync projects a flat Markdown source such as `.agents/rules/frontend.md` to `frontend/AGENTS.md` when it declares `path: frontend` in frontmatter, preserving directory scope. Future syncs may also scan native `AGENTS.md` files in repository subdirectories for import. A file that RosettAI did not generate is an import candidate, even if it is ignored by Git.
 
 **Planned, not implemented:** `rai sync` should import supported files automatically; `rai sync --dry-run` should preview the canonical destination, scope, projection changes, and file replacement. An untracked original must be backed up locally before replacement. A Git-tracked original may be imported, but its native projection remains a reported conflict until it is removed from Git tracking. `rai doctor` should explain such conflicts and any content that the canonical model cannot express. RosettAI must not silently drop harness-specific behavior.

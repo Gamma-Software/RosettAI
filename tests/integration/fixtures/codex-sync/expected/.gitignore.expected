@@ -1,6 +1,5 @@
-.DS_Store
-/target/
 # RosettAI generated files
 /AGENTS.md
 /.codex/config.toml
+/.codex/agents/reviewer.toml
 # End RosettAI generated files

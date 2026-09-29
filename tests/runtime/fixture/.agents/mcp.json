@@ -1,0 +1,10 @@
+{
+  "servers": {
+    "runtime_probe": {
+      "transport": "stdio",
+      "command": "python3",
+      "args": [".agents/runtime/runtime_probe_mcp.py"],
+      "default_tools_approval_mode": "approve"
+    }
+  }
+}

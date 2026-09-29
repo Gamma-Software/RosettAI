@@ -3,24 +3,6 @@ use std::io::Write;
 use std::process::Command;
 use std::process::Stdio;
 
-fn invoke_cursor_hook(repo: &std::path::Path) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
-        .args(["sync", "--cursor-hook", "--repo"])
-        .arg(repo)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(br#"{"prompt":"Implement the feature","attachments":[]}"#)
-        .unwrap();
-    child.wait_with_output().unwrap()
-}
-
 fn invoke_codex_hook(repo: &std::path::Path) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
         .args(["sync", "--codex-hook", "--repo"])
@@ -47,7 +29,6 @@ fn codex_hook_blocks_after_sync_then_allows_next_prompt() {
         "Use the test convention.\n",
     )
     .unwrap();
-    fs::write(repo.path().join(".agents/codex.json"), "{}").unwrap();
     let first = invoke_codex_hook(repo.path());
     assert!(first.status.success());
     assert!(String::from_utf8_lossy(&first.stdout).contains("\"decision\":\"block\""));
@@ -57,6 +38,18 @@ fn codex_hook_blocks_after_sync_then_allows_next_prompt() {
         String::from_utf8_lossy(&second.stdout).trim(),
         "{\"continue\":true}"
     );
+}
+
+#[test]
+fn removed_cursor_hook_option_is_rejected() {
+    let repo = tempfile::tempdir().unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["sync", "--cursor-hook", "--repo"])
+        .arg(repo.path())
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unknown option: --cursor-hook"));
 }
 
 fn assert_time_taken(stderr: &[u8]) {
@@ -95,130 +88,17 @@ fn cli_dry_run_then_sync_then_noop() {
 
     let preview = invoke(true);
     assert!(preview.status.success());
-    assert!(String::from_utf8_lossy(&preview.stdout).contains("Create CLAUDE.md"));
-    assert!(!repo.path().join("CLAUDE.md").exists());
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("Create AGENTS.md"));
+    assert!(!repo.path().join("AGENTS.md").exists());
 
     let first = invoke(false);
     assert!(first.status.success());
-    assert!(repo.path().join("CLAUDE.md").exists());
-    assert!(repo.path().join(".cursor/rules/rosettai.mdc").exists());
+    assert!(repo.path().join("AGENTS.md").exists());
+    assert!(repo.path().join(".codex/config.toml").exists());
 
     let second = invoke(false);
     assert!(second.status.success());
-    assert!(String::from_utf8_lossy(&second.stdout).contains("Unchanged CLAUDE.md"));
-}
-
-#[test]
-fn cursor_hook_allows_an_already_synchronized_prompt() {
-    let repo = tempfile::tempdir().unwrap();
-    fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
-    fs::write(
-        repo.path().join(".agents/rules/general.md"),
-        "Use explicit error types.\n",
-    )
-    .unwrap();
-    assert!(
-        Command::new(env!("CARGO_BIN_EXE_rai"))
-            .args(["sync", "--repo"])
-            .arg(repo.path())
-            .status()
-            .unwrap()
-            .success()
-    );
-
-    let hook = invoke_cursor_hook(repo.path());
-    assert!(hook.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&hook.stdout).trim(),
-        r#"{"continue":true}"#
-    );
-    assert!(hook.stderr.is_empty());
-}
-
-#[test]
-fn cursor_hook_syncs_drift_blocks_once_then_allows_resubmission() {
-    let repo = tempfile::tempdir().unwrap();
-    fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
-    let source = repo.path().join(".agents/rules/general.md");
-    fs::write(&source, "Use the old API.\n").unwrap();
-    assert!(
-        Command::new(env!("CARGO_BIN_EXE_rai"))
-            .args(["sync", "--repo"])
-            .arg(repo.path())
-            .status()
-            .unwrap()
-            .success()
-    );
-    fs::write(&source, "Use the new API.\n").unwrap();
-
-    let first = invoke_cursor_hook(repo.path());
-    let first_json = String::from_utf8_lossy(&first.stdout);
-    assert!(first.status.success());
-    assert!(first_json.contains(r#""continue":false"#));
-    assert!(first_json.contains("Resubmit your prompt"));
-    assert!(first_json.contains(".cursor/rules/rosettai.mdc"));
-    let projection = fs::read_to_string(repo.path().join(".cursor/rules/rosettai.mdc")).unwrap();
-    assert!(projection.contains("Use the new API."));
-    assert!(!projection.contains("Use the old API."));
-
-    let second = invoke_cursor_hook(repo.path());
-    assert!(second.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&second.stdout).trim(),
-        r#"{"continue":true}"#
-    );
-}
-
-#[test]
-fn cursor_hook_blocks_conflicts_without_overwriting_user_files() {
-    let repo = tempfile::tempdir().unwrap();
-    fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
-    fs::write(
-        repo.path().join(".agents/rules/general.md"),
-        "Canonical rule.\n",
-    )
-    .unwrap();
-    fs::create_dir_all(repo.path().join(".cursor/rules")).unwrap();
-    let projection = repo.path().join(".cursor/rules/rosettai.mdc");
-    fs::write(&projection, "User-owned Cursor rule.\n").unwrap();
-
-    let hook = invoke_cursor_hook(repo.path());
-    let output = String::from_utf8_lossy(&hook.stdout);
-    assert!(hook.status.success());
-    assert!(output.contains(r#""continue":false"#));
-    assert!(output.contains("synchronization is blocked"));
-    assert!(output.contains("unowned or modified output conflict"));
-    assert_eq!(
-        fs::read_to_string(&projection).unwrap(),
-        "User-owned Cursor rule.\n"
-    );
-    assert!(!repo.path().join("CLAUDE.md").exists());
-}
-
-#[test]
-fn cursor_hook_blocks_when_canonical_rules_are_invalid() {
-    let repo = tempfile::tempdir().unwrap();
-    fs::create_dir_all(repo.path().join(".agents/rules/scoped")).unwrap();
-
-    let hook = invoke_cursor_hook(repo.path());
-    let output = String::from_utf8_lossy(&hook.stdout);
-    assert!(hook.status.success());
-    assert!(output.contains(r#""continue":false"#));
-    assert!(output.contains("scoped rules are not supported"));
-    assert!(!repo.path().join(".cursor/rules/rosettai.mdc").exists());
-}
-
-#[test]
-fn cursor_hook_blocks_when_agents_directory_is_missing() {
-    let repo = tempfile::tempdir().unwrap();
-
-    let hook = invoke_cursor_hook(repo.path());
-    let output = String::from_utf8_lossy(&hook.stdout);
-    assert!(hook.status.success());
-    assert!(output.contains(r#""continue":false"#));
-    assert!(output.contains("RosettAI cannot check this prompt"));
-    assert!(output.contains("no .agents/ directory found"));
-    assert!(hook.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&second.stdout).contains("Unchanged AGENTS.md"));
 }
 
 #[test]
@@ -331,7 +211,7 @@ fn status_reports_unowned_collision() {
     let repo = tempfile::tempdir().unwrap();
     fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
     fs::write(repo.path().join(".agents/rules/general.md"), "Rule\n").unwrap();
-    fs::write(repo.path().join("CLAUDE.md"), "Manual\n").unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "Manual\n").unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_rai"))
         .args(["status", "--json", "--repo"])
         .arg(repo.path())
@@ -390,7 +270,7 @@ fn setup_installs_isolated_hook_that_syncs_a_repo() {
     let status = Command::new(&hook).current_dir(&repo).status().unwrap();
     assert!(status.success());
     assert!(
-        fs::read_to_string(repo.join("CLAUDE.md"))
+        fs::read_to_string(repo.join("AGENTS.md"))
             .unwrap()
             .contains("Hook rule.")
     );
@@ -446,7 +326,7 @@ fn setup_installs_isolated_hook_that_syncs_a_repo() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(
-        fs::read_to_string(clone.join("CLAUDE.md"))
+        fs::read_to_string(clone.join("AGENTS.md"))
             .unwrap()
             .contains("Clone rule.")
     );

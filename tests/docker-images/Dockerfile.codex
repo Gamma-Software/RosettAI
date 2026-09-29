@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1-bookworm AS rai-builder
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --locked --release
+
+FROM node:22-bookworm-slim
+
+ARG CODEX_VERSION=0.158.0
+
+LABEL org.opencontainers.image.title="Codex CLI"
+LABEL org.opencontainers.image.description="Container image with the OpenAI Codex CLI installed"
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        git \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global "@openai/codex@${CODEX_VERSION}" \
+    && npm cache clean --force
+
+RUN mkdir -p /workspace /home/node/.codex \
+    && chown -R node:node /workspace /home/node/.codex
+
+COPY --from=rai-builder /build/target/release/rai /usr/local/bin/rai
+COPY --chmod=755 tests/docker-images/codex-smoke.sh /usr/local/bin/codex-smoke
+
+USER node
+WORKDIR /workspace
+
+CMD ["codex-smoke"]

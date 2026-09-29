@@ -1,0 +1,4 @@
+name: runtime_reviewer
+description: Return a deterministic marker for the RosettAI runtime subagent test.
+sandbox_mode: read-only
+developer_instructions: Return exactly ROSETTAI_SUBAGENT_LOADED when asked for the runtime subagent marker.

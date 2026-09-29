@@ -1,0 +1,25 @@
+# rai-generated sha256:03e808f996b1421bde0e02b6050ba4c8ed1a6d70b472c23c97950d64987d98ea
+# Codex projection from .agents/ (tested with codex-cli 0.152.1)
+
+[mcp_servers.docs]
+url = "https://example.invalid/mcp"
+bearer_token_env_var = "DOCS_TOKEN"
+
+[mcp_servers.local]
+command = "npx"
+cwd = "tools"
+args = ["-y", "example-mcp"]
+env_vars = ["LOCAL_TOKEN"]
+
+[agents]
+enabled = true
+
+[agents.reviewer]
+config_file = "agents/reviewer.toml"
+description = "Review changes for correctness and regressions."
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "rai sync --codex-hook"
+timeout = 30

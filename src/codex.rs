@@ -5,24 +5,6 @@ use std::process::Command;
 
 const MIN_VERSION: (u32, u32, u32) = (0, 152, 1);
 
-pub fn enabled(root: &Path) -> Result<bool, String> {
-    let path = root.join(".agents/codex.json");
-    if !path.exists() {
-        return Ok(false);
-    }
-    if path.is_symlink() {
-        return Err("symlink source unsupported: .agents/codex.json".into());
-    }
-    let value = read_json(&path)?;
-    let object = value
-        .as_object()
-        .ok_or(".agents/codex.json must be an object")?;
-    if !object.is_empty() {
-        return Err(".agents/codex.json must be an empty object (Codex opt-in)".into());
-    }
-    Ok(true)
-}
-
 pub fn parse_version(output: &str) -> Result<(u32, u32, u32), String> {
     let version = output
         .trim()
@@ -60,6 +42,7 @@ pub fn check_version() -> Result<(), String> {
 pub fn outputs(root: &Path) -> Result<Vec<(String, String)>, String> {
     let mut config =
         String::from("# Codex projection from .agents/ (tested with codex-cli 0.152.1)\n");
+    let subagents = read_subagents(root)?;
     let mcp_path = root.join(".agents/mcp.json");
     if mcp_path.exists() {
         if mcp_path.is_symlink() {
@@ -83,9 +66,21 @@ pub fn outputs(root: &Path) -> Result<Vec<(String, String)>, String> {
                 .and_then(Value::as_str)
                 .ok_or("MCP transport is required")?;
             let allowed: &[&str] = if transport == "stdio" {
-                &["transport", "command", "args", "cwd", "env_vars"]
+                &[
+                    "transport",
+                    "command",
+                    "args",
+                    "cwd",
+                    "env_vars",
+                    "default_tools_approval_mode",
+                ]
             } else if transport == "http" {
-                &["transport", "url", "bearer_token_env_var"]
+                &[
+                    "transport",
+                    "url",
+                    "bearer_token_env_var",
+                    "default_tools_approval_mode",
+                ]
             } else {
                 return Err(format!("unsupported MCP transport for {name}: {transport}"));
             };
@@ -120,14 +115,58 @@ pub fn outputs(root: &Path) -> Result<Vec<(String, String)>, String> {
                     config.push_str(&string_field("bearer_token_env_var", value)?);
                 }
             }
+            if let Some(value) = fields.get("default_tools_approval_mode") {
+                let mode = value
+                    .as_str()
+                    .ok_or("default_tools_approval_mode must be a string")?;
+                if !["auto", "prompt", "writes", "approve"].contains(&mode) {
+                    return Err(format!("unsupported MCP approval mode for {name}: {mode}"));
+                }
+                config.push_str(&string_field("default_tools_approval_mode", value)?);
+            }
+        }
+    }
+    if !subagents.is_empty() {
+        config.push_str("\n[agents]\nenabled = true\n");
+        for subagent in &subagents {
+            let name = subagent["name"].as_str().unwrap();
+            config.push_str(&format!("\n[agents.{name}]\n"));
+            config.push_str(&format!("config_file = \"agents/{name}.toml\"\n"));
+            config.push_str(&string_field("description", &subagent["description"])?);
         }
     }
     config.push_str("\n[[hooks.UserPromptSubmit]]\n[[hooks.UserPromptSubmit.hooks]]\ntype = \"command\"\ncommand = \"rai sync --codex-hook\"\ntimeout = 30\n");
     let mut result = vec![(".codex/config.toml".to_string(), config)];
-    let agents_dir = root.join(".agents/agents");
+    for subagent in subagents {
+        let name = subagent["name"].as_str().unwrap();
+        let mut body = String::new();
+        for field in [
+            "name",
+            "description",
+            "model",
+            "model_reasoning_effort",
+            "sandbox_mode",
+            "developer_instructions",
+        ] {
+            if let Some(value) = subagent.get(field) {
+                body.push_str(&string_field(field, value)?);
+            }
+        }
+        if let Some(value) = subagent.get("nickname_candidates") {
+            body.push_str(&array_field("nickname_candidates", value)?);
+        }
+        result.push((format!(".codex/agents/{name}.toml"), body));
+    }
+    validate_skills(root)?;
+    Ok(result)
+}
+
+fn read_subagents(root: &Path) -> Result<Vec<Value>, String> {
+    let mut subagents = Vec::new();
+    let agents_dir = root.join(".agents/subagents");
     if agents_dir.exists() {
         if agents_dir.is_symlink() {
-            return Err("symlink source unsupported: .agents/agents".into());
+            return Err("symlink source unsupported: .agents/subagents".into());
         }
         let mut entries = fs::read_dir(&agents_dir)
             .map_err(|e| e.to_string())?
@@ -137,39 +176,65 @@ pub fn outputs(root: &Path) -> Result<Vec<(String, String)>, String> {
         for path in entries {
             if path.is_symlink()
                 || !path.is_file()
-                || path.extension().is_none_or(|ext| ext != "json")
+                || path.extension().is_none_or(|ext| ext != "yaml")
             {
                 return Err(format!(
-                    "only regular .json agents are supported: {}",
+                    "only regular .yaml subagents are supported: {}",
                     path.display()
                 ));
             }
             let name = path.file_stem().unwrap().to_string_lossy();
             valid_name(&name)?;
-            let value = read_json(&path)?;
-            let fields = value.as_object().ok_or("agent must be an object")?;
+            let source =
+                fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let value: Value =
+                serde_yaml::from_str(&source).map_err(|e| format!("{}: {e}", path.display()))?;
+            let fields = value.as_object().ok_or("subagent must be an object")?;
             for key in fields.keys() {
-                if !["name", "description", "developer_instructions"].contains(&key.as_str()) {
-                    return Err(format!("unsupported agent field {name}.{key}"));
+                if ![
+                    "name",
+                    "description",
+                    "developer_instructions",
+                    "model",
+                    "model_reasoning_effort",
+                    "sandbox_mode",
+                    "nickname_candidates",
+                ]
+                .contains(&key.as_str())
+                {
+                    return Err(format!("unsupported subagent field {name}.{key}"));
                 }
             }
-            let mut body = String::new();
-            for field in ["name", "description", "developer_instructions"] {
-                body.push_str(&string_field(
-                    field,
-                    fields
-                        .get(field)
-                        .ok_or(format!("agent {name} needs {field}"))?,
-                )?);
-            }
+            let field = |field| {
+                fields
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .ok_or(format!("subagent {name} needs string {field}"))
+            };
             if fields["name"].as_str() != Some(name.as_ref()) {
-                return Err(format!("agent name must match filename: {name}"));
+                return Err(format!("subagent name must match filename: {name}"));
             }
-            result.push((format!(".codex/agents/{name}.toml"), body));
+            field("description")?;
+            field("developer_instructions")?;
+            for optional in ["model", "model_reasoning_effort", "sandbox_mode"] {
+                if fields.contains_key(optional) {
+                    field(optional)?;
+                }
+            }
+            if let Some(value) = fields.get("nickname_candidates") {
+                let candidates = value.as_array().ok_or(format!(
+                    "subagent {name} nickname_candidates must be an array"
+                ))?;
+                if candidates.is_empty() || candidates.iter().any(|value| !value.is_string()) {
+                    return Err(format!(
+                        "subagent {name} nickname_candidates must contain strings"
+                    ));
+                }
+            }
+            subagents.push(value);
         }
     }
-    validate_skills(root)?;
-    Ok(result)
+    Ok(subagents)
 }
 
 fn validate_skills(root: &Path) -> Result<(), String> {

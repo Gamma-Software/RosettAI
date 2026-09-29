@@ -1,0 +1,16 @@
+{
+  "servers": {
+    "docs": {
+      "transport": "http",
+      "url": "https://example.invalid/mcp",
+      "bearer_token_env_var": "DOCS_TOKEN"
+    },
+    "local": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "example-mcp"],
+      "cwd": "tools",
+      "env_vars": ["LOCAL_TOKEN"]
+    }
+  }
+}

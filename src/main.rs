@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -9,12 +10,12 @@ mod codex;
 mod perf;
 mod setup;
 
-const CLAUDE: &str = "CLAUDE.md";
-const CURSOR: &str = ".cursor/rules/rosettai.mdc";
 const CODEX: &str = "AGENTS.md";
+const LEGACY_CLAUDE: &str = "CLAUDE.md";
+const LEGACY_CURSOR: &str = ".cursor/rules/rosettai.mdc";
 const IGNORE_START: &str = "# RosettAI generated files";
 const IGNORE_END: &str = "# End RosettAI generated files";
-const CURSOR_FRONTMATTER: &str =
+const LEGACY_CURSOR_FRONTMATTER: &str =
     "---\ndescription: Shared RosettAI rules\nalwaysApply: true\n---\n";
 const MARKER_START: &str = "<!-- rai-generated sha256:";
 
@@ -57,7 +58,6 @@ fn run(args: Vec<String>) -> Result<(), String> {
     let mut dry_run = false;
     let mut json = false;
     let mut perf = false;
-    let mut cursor_hook = false;
     let mut codex_hook = false;
     let mut repo = None;
     let mut roots = Vec::new();
@@ -66,7 +66,6 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--dry-run" => dry_run = true,
             "--json" => json = true,
             "--perf" => perf = true,
-            "--cursor-hook" => cursor_hook = true,
             "--codex-hook" => codex_hook = true,
             "--repo" => repo = Some(PathBuf::from(args.next().ok_or("--repo needs a path")?)),
             "--root" => roots.push(PathBuf::from(args.next().ok_or("--root needs a path")?)),
@@ -82,19 +81,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if !roots.is_empty() && command != "setup" {
         return Err("--root is only valid with setup".into());
     }
-    if cursor_hook && command != "sync" {
-        return Err("--cursor-hook is only valid with sync".into());
-    }
     if codex_hook && command != "sync" {
         return Err("--codex-hook is only valid with sync".into());
     }
-    if codex_hook && (cursor_hook || dry_run || json) {
-        return Err(
-            "--codex-hook cannot be combined with --cursor-hook, --dry-run or --json".into(),
-        );
-    }
-    if cursor_hook && (dry_run || json) {
-        return Err("--cursor-hook cannot be combined with --dry-run or --json".into());
+    if codex_hook && (dry_run || json) {
+        return Err("--codex-hook cannot be combined with --dry-run or --json".into());
     }
     if repo.is_some() && command == "setup" {
         return Err("--repo is not valid with setup".into());
@@ -112,18 +103,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if command == "init" {
         return init(&start);
     }
-    let root = if cursor_hook || codex_hook {
+    let root = if codex_hook {
         match find_repo(&start) {
             Ok(root) => root,
             Err(error) => {
-                if codex_hook {
-                    print_codex_hook_result(&format!("RosettAI cannot check this prompt: {error}"));
-                } else {
-                    print_cursor_hook_result(
-                        false,
-                        &format!("RosettAI cannot check this prompt: {error}"),
-                    );
-                }
+                print_codex_hook_result(&format!("RosettAI cannot check this prompt: {error}"));
                 return Ok(());
             }
         }
@@ -136,7 +120,6 @@ fn run(args: Vec<String>) -> Result<(), String> {
         find_repo(&start)?
     };
     match command.as_str() {
-        "sync" if cursor_hook => sync_cursor_hook(&root),
         "sync" if codex_hook => sync_codex_hook(&root),
         "sync" => sync_with_format(&root, dry_run, json),
         "status" => status(&root, json),
@@ -146,7 +129,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: rai <setup|init|status|sync|doctor> [--repo PATH] [--root PATH] [--dry-run] [--json] [--cursor-hook] [--codex-hook] [--perf]"
+    "usage: rai <setup|init|status|sync|doctor> [--repo PATH] [--root PATH] [--dry-run] [--json] [--codex-hook] [--perf]"
         .into()
 }
 
@@ -234,66 +217,6 @@ fn apply_changes(changes: Vec<Change>) -> Result<(), String> {
     Ok(())
 }
 
-fn sync_cursor_hook(root: &Path) -> Result<(), String> {
-    // Drain Cursor's JSON event payload so a large prompt cannot leave the writer blocked.
-    // The project hook runs from the repository root, so repository discovery remains the
-    // authoritative source of the path rather than trusting data from stdin.
-    let mut input = String::new();
-    io::stdin()
-        .read_to_string(&mut input)
-        .map_err(|e| format!("cannot read Cursor hook input: {e}"))?;
-
-    let changes = match plan_sync(root) {
-        Ok(changes) => changes,
-        Err(error) => {
-            print_cursor_hook_result(
-                false,
-                &format!("RosettAI synchronization is blocked: {error}"),
-            );
-            return Ok(());
-        }
-    };
-    if changes
-        .iter()
-        .all(|change| change.action == Action::Unchanged)
-    {
-        println!("{{\"continue\":true}}");
-        return Ok(());
-    }
-    let changed_paths = changes
-        .iter()
-        .filter(|change| change.action != Action::Unchanged)
-        .map(|change| {
-            change
-                .path
-                .strip_prefix(root)
-                .expect("planned path inside repo")
-                .to_string_lossy()
-                .into_owned()
-        })
-        .collect::<Vec<_>>();
-    match apply_changes(changes) {
-        Ok(()) => print_cursor_hook_result(
-            false,
-            &format!(
-                "RosettAI synchronized {}. Resubmit your prompt so Cursor resolves the updated rules before calling the model.",
-                changed_paths.join(", ")
-            ),
-        ),
-        Err(error) => {
-            print_cursor_hook_result(false, &format!("RosettAI synchronization failed: {error}"))
-        }
-    }
-    Ok(())
-}
-
-fn print_cursor_hook_result(continue_prompt: bool, message: &str) {
-    println!(
-        "{{\"continue\":{continue_prompt},\"user_message\":{}}}",
-        json_string(message)
-    );
-}
-
 fn sync_codex_hook(root: &Path) -> Result<(), String> {
     let mut input = String::new();
     io::stdin()
@@ -343,21 +266,22 @@ fn print_codex_hook_result(message: &str) {
 }
 
 fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
-    let rules = read_rules(&root.join(".agents/rules"))?;
-    let body = format!("# Shared project rules\n\n{rules}");
-    let codex_enabled = codex::enabled(root)?;
-    let mut outputs = vec![(CLAUDE.to_string(), owned(&body, ""), "".to_string())];
-    outputs.push((
-        CURSOR.to_string(),
-        owned(&body, CURSOR_FRONTMATTER),
-        CURSOR_FRONTMATTER.to_string(),
-    ));
-    if codex_enabled {
-        codex::check_version()?;
-        outputs.push((CODEX.to_string(), owned(&body, ""), "".to_string()));
-        for (path, body) in codex::outputs(root)? {
-            outputs.push((path, owned_comment(&body), "#".to_string()));
-        }
+    let rules = read_rules(root)?;
+    codex::check_version()?;
+    let mut outputs = rules
+        .into_iter()
+        .map(|(scope, sections)| {
+            let relative = if scope.is_empty() {
+                CODEX.to_string()
+            } else {
+                format!("{scope}/{CODEX}")
+            };
+            let body = format!("# Shared project rules\n\n{}\n", sections.join("\n\n"));
+            (relative, owned(&body, ""), "".to_string())
+        })
+        .collect::<Vec<_>>();
+    for (path, body) in codex::outputs(root)? {
+        outputs.push((path, owned_comment(&body), "#".to_string()));
     }
 
     // Plan every write before applying any of them. A single collision aborts the sync.
@@ -402,8 +326,11 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         });
     }
 
-    if codex_enabled {
+    {
         let agents_dir = root.join(".codex/agents");
+        if agents_dir.is_symlink() {
+            return Err("symlink output conflict: .codex/agents".into());
+        }
         if agents_dir.is_dir() {
             for entry in fs::read_dir(&agents_dir).map_err(|e| e.to_string())? {
                 let path = entry.map_err(|e| e.to_string())?.path();
@@ -434,6 +361,31 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         }
     }
 
+    for (relative, prefix) in [
+        (LEGACY_CLAUDE, ""),
+        (LEGACY_CURSOR, LEGACY_CURSOR_FRONTMATTER),
+    ] {
+        let path = root.join(relative);
+        if path.is_symlink()
+            || path
+                .ancestors()
+                .take_while(|part| *part != root)
+                .any(Path::is_symlink)
+        {
+            continue;
+        }
+        if path.is_file() && !is_tracked(root, relative)? {
+            let current = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+            if is_owned(&current, prefix) {
+                changes.push(Change {
+                    path,
+                    content: String::new(),
+                    action: Action::Delete,
+                });
+            }
+        }
+    }
+
     let ignore_path = root.join(".gitignore");
     if ignore_path.is_symlink() {
         return Err("symlink output conflict: .gitignore".into());
@@ -443,6 +395,28 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
     } else {
         String::new()
     };
+    for relative in managed_instruction_paths(&old_ignore)? {
+        let path = root.join(&relative);
+        if changes.iter().any(|change| change.path == path) || is_tracked(root, &relative)? {
+            continue;
+        }
+        if path
+            .ancestors()
+            .take_while(|part| *part != root)
+            .any(Path::is_symlink)
+            || !path.is_file()
+        {
+            continue;
+        }
+        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        if is_owned(&content, "") {
+            changes.push(Change {
+                path,
+                content: String::new(),
+                action: Action::Delete,
+            });
+        }
+    }
     let paths = changes
         .iter()
         .filter(|change| change.action != Action::Delete)
@@ -628,8 +602,8 @@ fn solution_for_plan_error(error: &str) -> String {
     } else if error.starts_with("missing rules directory:") || error.starts_with("no .md rules in")
     {
         "Create at least one global Markdown rule in .agents/rules/, then run rai sync.".into()
-    } else if error.starts_with("scoped rules are not supported") {
-        "Keep scoped rules out of this POC or wait for scope-aware adapters; flattening them would change when they apply.".into()
+    } else if error.starts_with("scoped rule target is not a regular directory:") {
+        "Create the target repository directory or remove the rule's path frontmatter to make it global.".into()
     } else if error.starts_with("malformed RosettAI block") {
         "Repair the RosettAI start/end markers in the root .gitignore, then rerun rai sync.".into()
     } else if error.contains("symlink") {
@@ -818,40 +792,121 @@ fn json_string(value: &str) -> String {
     result
 }
 
-fn read_rules(dir: &Path) -> Result<String, String> {
+fn read_rules(root: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let dir = root.join(".agents/rules");
     if dir.is_symlink() || dir.parent().is_some_and(Path::is_symlink) {
         return Err(format!("symlink source unsupported: {}", dir.display()));
     }
     if !dir.is_dir() {
         return Err(format!("missing rules directory: {}", dir.display()));
     }
-    let mut files = fs::read_dir(dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .map(|entry| entry.map(|e| e.path()).map_err(|e| e.to_string()))
-        .collect::<Result<Vec<_>, _>>()?;
-    files.sort();
-    let mut sections = Vec::new();
-    for path in files {
-        if path.is_symlink() {
-            return Err(format!("symlink rule unsupported: {}", path.display()));
-        }
-        if path.is_dir() {
-            return Err(format!(
-                "scoped rules are not supported in this POC: {}",
-                path.display()
+    let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut count = 0;
+    {
+        let mut files = fs::read_dir(&dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .map(|entry| entry.map(|e| e.path()).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()?;
+        files.sort();
+        for path in files {
+            if path.is_symlink() {
+                return Err(format!("symlink rule unsupported: {}", path.display()));
+            }
+            if path.is_dir() {
+                return Err(format!(
+                    "rules must be Markdown files directly in .agents/rules: {}",
+                    path.display()
+                ));
+            }
+            if path.extension().is_none_or(|ext| ext != "md") {
+                return Err(format!("only .md rules are supported: {}", path.display()));
+            }
+            count += 1;
+            let source = path.strip_prefix(&dir).map_err(|e| e.to_string())?;
+            let content =
+                fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let (scope, body) =
+                parse_rule(&content).map_err(|e| format!("{}: {e}", path.display()))?;
+            if !scope.is_empty() {
+                let target = root.join(&scope);
+                if target.is_symlink() || !target.is_dir() {
+                    return Err(format!(
+                        "scoped rule target is not a regular directory: {}",
+                        target.display()
+                    ));
+                }
+            }
+            sections.entry(scope).or_default().push(format!(
+                "## {}\n\n{}",
+                source.display(),
+                body.trim()
             ));
         }
-        if path.extension().is_none_or(|ext| ext != "md") {
-            return Err(format!("only .md rules are supported: {}", path.display()));
-        }
-        let name = path.file_name().unwrap().to_string_lossy();
-        let content = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        sections.push(format!("## {name}\n\n{}", content.trim()));
     }
-    if sections.is_empty() {
+    if count == 0 {
         return Err(format!("no .md rules in {}", dir.display()));
     }
-    Ok(format!("{}\n", sections.join("\n\n")))
+    Ok(sections)
+}
+
+fn parse_rule(content: &str) -> Result<(String, &str), String> {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return Ok((String::new(), content));
+    };
+    let (metadata, body) = rest
+        .split_once("\n---\n")
+        .ok_or("unterminated rule frontmatter")?;
+    let mut scope = None;
+    for line in metadata.lines() {
+        let value = line
+            .strip_prefix("path: ")
+            .ok_or("unsupported rule frontmatter field; expected `path: <directory>`")?;
+        if scope.is_some() {
+            return Err("duplicate rule path".into());
+        }
+        let value = value.trim();
+        if value == "." {
+            scope = Some(String::new());
+        } else if value.is_empty()
+            || value.contains('\\')
+            || !Path::new(value)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            return Err(format!("invalid rule path: {value}"));
+        } else {
+            scope = Some(value.to_owned());
+        }
+    }
+    let scope = scope.ok_or("rule frontmatter requires `path: <directory>`")?;
+    Ok((scope, body))
+}
+
+fn managed_instruction_paths(ignore: &str) -> Result<Vec<String>, String> {
+    let Some(start) = ignore.find(IGNORE_START) else {
+        return Ok(Vec::new());
+    };
+    let end = ignore
+        .find(IGNORE_END)
+        .ok_or("malformed RosettAI block in .gitignore")?;
+    if start >= end {
+        return Err("malformed RosettAI block in .gitignore".into());
+    }
+    let mut paths = Vec::new();
+    for line in ignore[start + IGNORE_START.len()..end].lines() {
+        let Some(relative) = line.strip_prefix('/') else {
+            continue;
+        };
+        let candidate = Path::new(relative);
+        if candidate.file_name().is_some_and(|name| name == CODEX)
+            && candidate
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            paths.push(relative.to_owned());
+        }
+    }
+    Ok(paths)
 }
 
 fn owned(body: &str, prefix: &str) -> String {
@@ -947,20 +1002,23 @@ mod tests {
     }
 
     #[test]
-    fn creates_both_projections_and_is_idempotent() {
+    fn creates_codex_projections_and_is_idempotent() {
         let dir = repo();
         sync(dir.path(), false).unwrap();
-        let claude = fs::read_to_string(dir.path().join(CLAUDE)).unwrap();
-        let cursor = fs::read_to_string(dir.path().join(CURSOR)).unwrap();
-        assert!(claude.contains("Prefer clear names."));
-        assert!(cursor.starts_with(CURSOR_FRONTMATTER));
-        assert!(cursor.contains("Prefer clear names."));
-        assert!(is_owned(&claude, ""));
-        assert!(is_owned(&cursor, CURSOR_FRONTMATTER));
+        let agents = fs::read_to_string(dir.path().join(CODEX)).unwrap();
+        let config = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        assert!(agents.contains("Prefer clear names."));
+        assert!(is_owned(&agents, ""));
+        assert!(is_owned_comment(&config));
+        assert!(!dir.path().join(LEGACY_CLAUDE).exists());
+        assert!(!dir.path().join(LEGACY_CURSOR).exists());
         let ignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         sync(dir.path(), false).unwrap();
-        assert_eq!(claude, fs::read_to_string(dir.path().join(CLAUDE)).unwrap());
-        assert_eq!(cursor, fs::read_to_string(dir.path().join(CURSOR)).unwrap());
+        assert_eq!(agents, fs::read_to_string(dir.path().join(CODEX)).unwrap());
+        assert_eq!(
+            config,
+            fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap()
+        );
         assert_eq!(
             ignore,
             fs::read_to_string(dir.path().join(".gitignore")).unwrap()
@@ -969,12 +1027,9 @@ mod tests {
     }
 
     #[test]
-    fn codex_projection_converts_rules_mcp_agents_and_preserves_skills() {
+    fn codex_projection_converts_rules_mcp_and_preserves_skills() {
         let dir = repo();
-        fs::write(dir.path().join(".agents/codex.json"), "{}\n").unwrap();
-        fs::write(dir.path().join(".agents/mcp.json"), r#"{"servers":{"docs":{"transport":"http","url":"https://example.com/mcp","bearer_token_env_var":"DOCS_TOKEN"},"local":{"transport":"stdio","command":"npx","args":["-y","example-mcp"],"env_vars":["LOCAL_TOKEN"]}}}"#).unwrap();
-        fs::create_dir_all(dir.path().join(".agents/agents")).unwrap();
-        fs::write(dir.path().join(".agents/agents/reviewer.json"), r#"{"name":"reviewer","description":"Reviews changes","developer_instructions":"Check tests and risks."}"#).unwrap();
+        fs::write(dir.path().join(".agents/mcp.json"), r#"{"servers":{"docs":{"transport":"http","url":"https://example.com/mcp","bearer_token_env_var":"DOCS_TOKEN"},"local":{"transport":"stdio","command":"npx","args":["-y","example-mcp"],"env_vars":["LOCAL_TOKEN"],"default_tools_approval_mode":"approve"}}}"#).unwrap();
         fs::create_dir_all(dir.path().join(".agents/skills/checks")).unwrap();
         fs::write(
             dir.path().join(".agents/skills/checks/SKILL.md"),
@@ -984,7 +1039,6 @@ mod tests {
         sync(dir.path(), false).unwrap();
         let agents = fs::read_to_string(dir.path().join(CODEX)).unwrap();
         let config = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
-        let custom = fs::read_to_string(dir.path().join(".codex/agents/reviewer.toml")).unwrap();
         assert!(agents.contains("Prefer clear names."));
         assert!(config.contains("[mcp_servers.docs]"));
         assert!(config.contains("[mcp_servers.local]"));
@@ -995,14 +1049,16 @@ mod tests {
             Some("https://example.com/mcp")
         );
         assert_eq!(
+            parsed["mcp_servers"]["local"]["default_tools_approval_mode"].as_str(),
+            Some("approve")
+        );
+        assert_eq!(
             parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"].as_str(),
             Some("rai sync --codex-hook")
         );
-        assert!(custom.contains("Check tests and risks."));
         assert!(dir.path().join(".agents/skills/checks/SKILL.md").exists());
         assert!(is_owned(&agents, ""));
         assert!(is_owned_comment(&config));
-        assert!(is_owned_comment(&custom));
         assert_eq!(
             plan_sync(dir.path())
                 .unwrap()
@@ -1029,56 +1085,115 @@ mod tests {
     #[test]
     fn codex_unowned_agents_file_aborts() {
         let dir = repo();
-        fs::write(dir.path().join(".agents/codex.json"), "{}").unwrap();
         fs::write(dir.path().join(CODEX), "User rules\n").unwrap();
         assert!(sync(dir.path(), false).unwrap_err().contains("unowned"));
         assert!(!dir.path().join(".codex/config.toml").exists());
     }
 
     #[test]
-    fn deleted_canonical_subagent_removes_only_owned_projection() {
+    fn canonical_yaml_subagents_are_projected() {
         let dir = repo();
-        fs::write(dir.path().join(".agents/codex.json"), "{}").unwrap();
-        fs::create_dir_all(dir.path().join(".agents/agents")).unwrap();
-        let source = dir.path().join(".agents/agents/reviewer.json");
+        fs::create_dir_all(dir.path().join(".agents/subagents")).unwrap();
+        let source = dir.path().join(".agents/subagents/reviewer.yaml");
         fs::write(
             &source,
-            r#"{"name":"reviewer","description":"Review","developer_instructions":"Check tests."}"#,
+            "name: reviewer\ndescription: Review changes\nmodel: gpt-6-luna\nmodel_reasoning_effort: high\nsandbox_mode: read-only\nnickname_candidates: [Atlas, Delta]\ndeveloper_instructions: |\n  Check tests and regressions.\n",
+        )
+        .unwrap();
+        sync(dir.path(), false).unwrap();
+        let config = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        let agent = fs::read_to_string(dir.path().join(".codex/agents/reviewer.toml")).unwrap();
+        assert!(config.contains("[agents.reviewer]"));
+        assert!(config.contains("config_file = \"agents/reviewer.toml\""));
+        assert!(is_owned_comment(&agent));
+        let parsed: toml::Value = agent.parse().unwrap();
+        assert_eq!(parsed["name"].as_str(), Some("reviewer"));
+        assert_eq!(parsed["model"].as_str(), Some("gpt-6-luna"));
+        assert_eq!(
+            parsed["developer_instructions"].as_str(),
+            Some("Check tests and regressions.\n")
+        );
+        assert_eq!(
+            parsed["nickname_candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["Atlas", "Delta"]
+        );
+    }
+
+    #[test]
+    fn removing_yaml_subagent_removes_only_owned_projection() {
+        let dir = repo();
+        fs::create_dir_all(dir.path().join(".agents/subagents")).unwrap();
+        let source = dir.path().join(".agents/subagents/reviewer.yaml");
+        fs::write(
+            &source,
+            "name: reviewer\ndescription: Review changes\ndeveloper_instructions: Check tests.\n",
         )
         .unwrap();
         sync(dir.path(), false).unwrap();
         let projection = dir.path().join(".codex/agents/reviewer.toml");
         assert!(projection.exists());
         fs::remove_file(source).unwrap();
-        assert!(
-            plan_sync(dir.path())
-                .unwrap()
-                .iter()
-                .any(|c| c.path == projection && c.action == Action::Delete)
-        );
         sync(dir.path(), false).unwrap();
         assert!(!projection.exists());
+        let config = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
+        assert!(!config.contains("agents.reviewer"));
+    }
+
+    #[test]
+    fn removes_only_owned_legacy_outputs() {
+        let dir = repo();
+        fs::create_dir_all(dir.path().join(".cursor/rules")).unwrap();
+        fs::write(dir.path().join(LEGACY_CLAUDE), owned("legacy\n", "")).unwrap();
+        fs::write(dir.path().join(LEGACY_CURSOR), "manual rule\n").unwrap();
+        sync(dir.path(), false).unwrap();
+        assert!(!dir.path().join(LEGACY_CLAUDE).exists());
+        assert_eq!(
+            fs::read_to_string(dir.path().join(LEGACY_CURSOR)).unwrap(),
+            "manual rule\n"
+        );
+        assert!(dir.path().join(CODEX).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_codex_agents_directory_is_rejected() {
+        use std::os::unix::fs::symlink;
+        let dir = repo();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".codex")).unwrap();
+        symlink(outside.path(), dir.path().join(".codex/agents")).unwrap();
+        assert!(
+            sync(dir.path(), false)
+                .unwrap_err()
+                .contains("symlink output")
+        );
+        assert!(!dir.path().join(CODEX).exists());
     }
 
     #[test]
     fn dry_run_writes_nothing() {
         let dir = repo();
         sync(dir.path(), true).unwrap();
-        assert!(!dir.path().join(CLAUDE).exists());
-        assert!(!dir.path().join(CURSOR).exists());
+        assert!(!dir.path().join(CODEX).exists());
+        assert!(!dir.path().join(".codex/config.toml").exists());
         assert!(!dir.path().join(".gitignore").exists());
     }
 
     #[test]
     fn unowned_collision_aborts_all_writes() {
         let dir = repo();
-        fs::write(dir.path().join(CLAUDE), "Personal instructions\n").unwrap();
+        fs::write(dir.path().join(CODEX), "Personal instructions\n").unwrap();
         let error = sync(dir.path(), false).unwrap_err();
         assert!(error.contains("unowned"));
-        assert!(!dir.path().join(CURSOR).exists());
+        assert!(!dir.path().join(".codex/config.toml").exists());
         assert!(!dir.path().join(".gitignore").exists());
         assert_eq!(
-            fs::read_to_string(dir.path().join(CLAUDE)).unwrap(),
+            fs::read_to_string(dir.path().join(CODEX)).unwrap(),
             "Personal instructions\n"
         );
     }
@@ -1087,7 +1202,7 @@ mod tests {
     fn edited_projection_is_not_overwritten() {
         let dir = repo();
         sync(dir.path(), false).unwrap();
-        let path = dir.path().join(CLAUDE);
+        let path = dir.path().join(CODEX);
         fs::write(
             &path,
             format!("{}manual edit\n", fs::read_to_string(&path).unwrap()),
@@ -1099,7 +1214,7 @@ mod tests {
     }
 
     #[test]
-    fn rule_changes_update_both_outputs() {
+    fn rule_changes_update_codex_output() {
         let dir = repo();
         sync(dir.path(), false).unwrap();
         fs::write(
@@ -1109,27 +1224,141 @@ mod tests {
         .unwrap();
         sync(dir.path(), false).unwrap();
         assert!(
-            fs::read_to_string(dir.path().join(CLAUDE))
-                .unwrap()
-                .contains("Write tests.")
-        );
-        assert!(
-            fs::read_to_string(dir.path().join(CURSOR))
+            fs::read_to_string(dir.path().join(CODEX))
                 .unwrap()
                 .contains("Write tests.")
         );
     }
 
     #[test]
-    fn scoped_rules_are_rejected() {
+    fn scoped_rules_generate_nested_agents_without_leaking_to_root() {
+        let dir = repo();
+        fs::create_dir_all(dir.path().join("frontend/components")).unwrap();
+        fs::write(
+            dir.path().join(".agents/rules/frontend.md"),
+            "---\npath: frontend\n---\nUse frontend conventions.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".agents/rules/components.md"),
+            "---\npath: frontend/components\n---\nUse component conventions.\n",
+        )
+        .unwrap();
+        sync(dir.path(), false).unwrap();
+        let root = fs::read_to_string(dir.path().join(CODEX)).unwrap();
+        let frontend = fs::read_to_string(dir.path().join("frontend/AGENTS.md")).unwrap();
+        let components =
+            fs::read_to_string(dir.path().join("frontend/components/AGENTS.md")).unwrap();
+        assert!(root.contains("Prefer clear names."));
+        assert!(!root.contains("frontend conventions"));
+        assert!(frontend.contains("frontend conventions"));
+        assert!(!frontend.contains("component conventions"));
+        assert!(components.contains("component conventions"));
+        let ignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(ignore.contains("/frontend/AGENTS.md"));
+        assert!(ignore.contains("/frontend/components/AGENTS.md"));
+    }
+
+    #[test]
+    fn two_flat_rules_merge_into_same_scope() {
+        let dir = repo();
+        fs::create_dir(dir.path().join("frontend")).unwrap();
+        fs::write(
+            dir.path().join(".agents/rules/frontend.md"),
+            "---\npath: frontend\n---\nNamed scope.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".agents/rules/frontend-extra.md"),
+            "---\npath: frontend\n---\nExtra scope.\n",
+        )
+        .unwrap();
+        sync(dir.path(), false).unwrap();
+        let projected = fs::read_to_string(dir.path().join("frontend/AGENTS.md")).unwrap();
+        assert!(projected.contains("Named scope."));
+        assert!(projected.contains("Extra scope."));
+        assert!(
+            !fs::read_to_string(dir.path().join(CODEX))
+                .unwrap()
+                .contains("Extra scope.")
+        );
+    }
+
+    #[test]
+    fn scoped_rule_without_target_directory_fails_before_writing() {
+        let dir = repo();
+        fs::write(
+            dir.path().join(".agents/rules/frontend.md"),
+            "---\npath: frontend\n---\nFrontend only.\n",
+        )
+        .unwrap();
+        assert!(
+            sync(dir.path(), false)
+                .unwrap_err()
+                .contains("scoped rule target")
+        );
+        assert!(!dir.path().join(CODEX).exists());
+    }
+
+    #[test]
+    fn invalid_scope_cannot_escape_repository() {
+        let dir = repo();
+        fs::write(
+            dir.path().join(".agents/rules/frontend.md"),
+            "---\npath: ../outside\n---\nUnsafe.\n",
+        )
+        .unwrap();
+        assert!(
+            sync(dir.path(), false)
+                .unwrap_err()
+                .contains("invalid rule path")
+        );
+        assert!(!dir.path().join(CODEX).exists());
+    }
+
+    #[test]
+    fn nested_rule_sources_are_rejected() {
         let dir = repo();
         fs::create_dir(dir.path().join(".agents/rules/frontend")).unwrap();
         assert!(
             sync(dir.path(), false)
                 .unwrap_err()
-                .contains("scoped rules")
+                .contains("directly in .agents/rules")
         );
-        assert!(!dir.path().join(CLAUDE).exists());
+        assert!(!dir.path().join(CODEX).exists());
+    }
+
+    #[test]
+    fn removed_scoped_rule_removes_only_owned_nested_projection() {
+        let dir = repo();
+        fs::create_dir(dir.path().join("frontend")).unwrap();
+        let source = dir.path().join(".agents/rules/frontend.md");
+        fs::write(&source, "---\npath: frontend\n---\nFrontend only.\n").unwrap();
+        sync(dir.path(), false).unwrap();
+        let projection = dir.path().join("frontend/AGENTS.md");
+        assert!(projection.exists());
+        fs::remove_file(source).unwrap();
+        sync(dir.path(), false).unwrap();
+        assert!(!projection.exists());
+        assert!(
+            !fs::read_to_string(dir.path().join(".gitignore"))
+                .unwrap()
+                .contains("/frontend/AGENTS.md")
+        );
+    }
+
+    #[test]
+    fn unowned_scoped_output_blocks_all_writes() {
+        let dir = repo();
+        fs::create_dir(dir.path().join("frontend")).unwrap();
+        fs::write(
+            dir.path().join(".agents/rules/frontend.md"),
+            "---\npath: frontend\n---\nFrontend only.\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("frontend/AGENTS.md"), "Handwritten\n").unwrap();
+        assert!(sync(dir.path(), false).unwrap_err().contains("unowned"));
+        assert!(!dir.path().join(CODEX).exists());
     }
 
     #[test]
@@ -1142,9 +1371,9 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        fs::write(dir.path().join(CLAUDE), "Tracked instructions\n").unwrap();
+        fs::write(dir.path().join(CODEX), "Tracked instructions\n").unwrap();
         let status = Command::new("git")
-            .args(["add", CLAUDE])
+            .args(["add", CODEX])
             .current_dir(dir.path())
             .status()
             .unwrap();
@@ -1218,7 +1447,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         let dir = repo();
         let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), dir.path().join(".cursor")).unwrap();
+        symlink(outside.path(), dir.path().join(".codex")).unwrap();
         assert!(
             sync(dir.path(), false)
                 .unwrap_err()

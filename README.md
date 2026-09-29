@@ -1,8 +1,8 @@
 # RosettAI
 
-RosettAI helps teams share AI coding agent configuration without requiring every developer to use the same harness. MCP and Skills provide some common ground, but rules, plugins, hooks, and other harness settings still differ between tools. RosettAI aims to let a team define its intent once, then generate configuration for each supported harness and explain any differences.
+RosettAI synchronizes canonical AI-agent resources from `.agents/` into Codex's native project configuration. Other harnesses remain future research, not supported outputs.
 
-The project is in an early proof-of-concept phase. The Rust CLI implements `setup`, `init`, `status`, `sync`, and `doctor` for global Markdown rules, plus an opt-in Codex adapter for MCP and custom agents. Scoped rules, native-file migration, and harness detection remain design proposals.
+The project is in an early proof-of-concept phase. The Rust CLI implements `setup`, `init`, `status`, `sync`, and `doctor` for Codex rules, YAML subagents, and MCP. Codex reads canonical skills in place. Directory-scoped rules are supported; native-file migration remains a design proposal.
 
 ## Product values
 
@@ -18,7 +18,7 @@ RosettAI's proposed model stores canonical resources in `.agents/`, validates th
 
 ## Try the Rust proof of concept
 
-Create one or more global Markdown rules in `.agents/rules/` of a test repository, then run:
+Create Markdown rules in `.agents/rules/` of a test repository, then run:
 
 ```sh
 cargo run -- sync --repo /path/to/test-repo --dry-run
@@ -26,7 +26,7 @@ cargo run -- sync --repo /path/to/test-repo
 cargo test
 ```
 
-By default the command generates `CLAUDE.md` and `.cursor/rules/rosettai.mdc`, and adds exact output paths to the repository-root `.gitignore`. Add `.agents/codex.json` containing `{}` for the [Codex adapter](docs/codex.md): it also generates `AGENTS.md`, `.codex/config.toml`, and custom subagents while using canonical skills in place. It refuses to replace existing unowned, modified, or Git-tracked outputs. This POC does not yet detect installed harnesses or support scoped rules and native-file migration. Use a test repository; existing native files will cause a reported conflict rather than being imported.
+The command generates root or directory-scoped `AGENTS.md` files, `.codex/config.toml`, and `.codex/agents/*.toml`, then adds exact output paths to the repository-root `.gitignore`. Rules stay directly in `.agents/rules/`; an optional `path: frontend` Markdown frontmatter field projects a rule to `frontend/AGENTS.md`. Subagents are authored as YAML in `.agents/subagents/`. See the [Codex workflow](docs/codex.md). It refuses to replace existing unowned, modified, or Git-tracked outputs. Native-file migration is not supported; use a test repository because existing native files cause a reported conflict rather than being imported.
 
 Run `cargo install --path .` to put `rai` on your `PATH`. Then `rai init` creates a starter `.agents/rules/general.md`, `rai status` previews drift, and `rai doctor` reports configuration problems. `rai setup --root /path/to/workspace` registers a workspace for polling and, on macOS, installs a per-user launchd watcher. It also configures Git hooks for future clones when no global hook path or custom template directory is already configured. Setup is not run automatically by installation. On other platforms, run the internal `rai watch` process manually for now.
 

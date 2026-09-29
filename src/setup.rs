@@ -396,7 +396,7 @@ mod tests {
         fs::write(repo.join(".agents/rules/general.md"), "Watch me.\n").unwrap();
         watch_once(&[dir.path().to_path_buf()]);
         assert!(
-            fs::read_to_string(repo.join("CLAUDE.md"))
+            fs::read_to_string(repo.join("AGENTS.md"))
                 .unwrap()
                 .contains("Watch me.")
         );

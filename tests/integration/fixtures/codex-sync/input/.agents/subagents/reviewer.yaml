@@ -1,0 +1,11 @@
+name: reviewer
+description: Review changes for correctness and regressions.
+model: gpt-6-luna
+model_reasoning_effort: high
+sandbox_mode: read-only
+nickname_candidates:
+  - Atlas
+  - Delta
+developer_instructions: |
+  Review the assigned changes.
+  Report concrete findings with file references.

@@ -1,5 +1,7 @@
 # AI coding-agent harnesses
 
+> Research inventory only. The current `rai` implementation targets Codex exclusively; entries below are not implemented adapters.
+
 Last reviewed: 2026-09-24.
 
 This document inventories developer-facing AI agent harnesses: applications that
