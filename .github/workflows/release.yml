@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to rebuild
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -13,9 +19,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
       - name: Check tag matches Cargo version
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           if [[ "$TAG" != "v$version" ]]; then
@@ -45,6 +53,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - name: Install Codex CLI for integration tests
+        run: npm install --global @openai/codex@0.158.0
       - name: Install Rust target
         run: rustup target add "${{ matrix.target }}"
       - name: Test
@@ -54,7 +66,7 @@ jobs:
       - name: Package Unix binary
         if: runner.os != 'Windows'
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
           TARGET: ${{ matrix.target }}
         run: |
           mkdir dist
@@ -63,7 +75,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
           TARGET: ${{ matrix.target }}
         run: |
           New-Item -ItemType Directory -Path dist
@@ -92,7 +104,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           options=()
           if [[ "$TAG" == *-* ]]; then
