@@ -28,16 +28,16 @@ try {
     Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS" -OutFile $checksumsPath -UseBasicParsing
     Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile $archivePath -UseBasicParsing
 
-    $matches = @(Get-Content $checksumsPath | ForEach-Object {
+    $checksumMatches = @(Get-Content $checksumsPath | ForEach-Object {
         if ($_ -match '^([0-9a-fA-F]{64})\s+\*?(.+)$' -and $Matches[2] -ceq $archive) {
             $Matches[1]
         }
     })
-    if ($matches.Count -ne 1) {
+    if ($checksumMatches.Count -ne 1) {
         Fail "SHA256SUMS has no unique valid entry for $archive"
     }
     $actual = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash
-    if ($actual -ine $matches[0]) {
+    if ($actual -ine $checksumMatches[0]) {
         Fail "SHA-256 mismatch for $archive"
     }
 
@@ -76,7 +76,7 @@ try {
     }
 
     Write-Output "Installed rai $tag at $destination"
-    Write-Output 'Open a new terminal, then run: rai --version'
+    Write-Output 'Open a new terminal, then run: rai status'
 } finally {
     if ($stagedBinary -and (Test-Path $stagedBinary)) {
         Remove-Item $stagedBinary -Force
