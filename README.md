@@ -21,7 +21,7 @@ RosettAI's proposed model stores canonical resources in `.agents/`, validates th
 On macOS or Linux, run:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Gamma-Software/RosettAI/main/install.sh | bash
+curl -fsSL https://rai.pival.fr | bash
 ```
 
 The script downloads the latest stable release for your platform, verifies its
