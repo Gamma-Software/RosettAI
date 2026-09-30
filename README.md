@@ -33,3 +33,7 @@ Run `cargo install --path .` to put `rai` on your `PATH`. Then `rai init` create
 In a terminal, `rai doctor` proposes a solution for each issue and lets you apply one safe fix or all available safe fixes. Unmanaged native files still require manual review; `--json` never prompts.
 
 Add `--perf` to any command (for example, `rai sync --dry-run --perf`) to print only its elapsed time to stderr without changing `--json` output.
+
+## Releases
+
+Pushing a version tag such as `v0.1.0` builds the CLI for Linux, macOS, and Windows and publishes the archives and checksums in a GitHub Release. The tag must match the version in `Cargo.toml`. See the [changelog](CHANGELOG.md) and the [CLI release skill](.agents/skills/release-cli/SKILL.md) for the preparation and verification steps.
