@@ -24,4 +24,9 @@ jobs:
           $testRepo = Join-Path $env:RUNNER_TEMP 'rai-project'
           New-Item -ItemType Directory -Path $testRepo | Out-Null
           & (Join-Path $env:RAI_INSTALL_DIR 'rai.exe') init --repo $testRepo
-          rai status --repo $testRepo
+          $pathRepo = Join-Path $env:RUNNER_TEMP 'rai-path-project'
+          New-Item -ItemType Directory -Path $pathRepo | Out-Null
+          rai init --repo $pathRepo
+          if (-not (Test-Path (Join-Path $pathRepo '.agents/rules/general.md'))) {
+            throw 'rai init did not create the starter rule'
+          }

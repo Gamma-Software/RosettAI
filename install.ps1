@@ -76,7 +76,7 @@ try {
     }
 
     Write-Output "Installed rai $tag at $destination"
-    Write-Output 'Open a new terminal, then run: rai status'
+    Write-Output 'Open a new terminal, then run: rai init'
 } finally {
     if ($stagedBinary -and (Test-Path $stagedBinary)) {
         Remove-Item $stagedBinary -Force
