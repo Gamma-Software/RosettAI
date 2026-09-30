@@ -16,6 +16,21 @@ The project is in an early proof-of-concept phase. The Rust CLI implements `setu
 
 RosettAI's proposed model stores canonical resources in `.agents/`, validates them, and synchronizes local projections for supported installed harnesses. See the [current design](docs/doc.md) and [`rai` CLI contract](docs/cli.md). The [earlier architecture proposal](docs/architecture/README.md) remains available for background.
 
+## Install the prebuilt CLI
+
+On macOS or Linux, run:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Gamma-Software/RosettAI/main/install.sh | bash
+```
+
+The script downloads the latest stable release for your platform, verifies its
+SHA-256 checksum, and installs `rai` in a user-owned directory. It reuses an
+existing `~/.cargo/bin/rai` or `~/.local/bin/rai` location; otherwise it uses
+`~/.local/bin`. Set `RAI_INSTALL_DIR` to choose another directory. The script
+prints a PATH hint when needed. No Rust toolchain or local build is required.
+Windows users can download the prebuilt ZIP from [GitHub Releases](https://github.com/Gamma-Software/RosettAI/releases/latest).
+
 ## Try the Rust proof of concept
 
 Create Markdown rules in `.agents/rules/` of a test repository, then run:
@@ -28,7 +43,7 @@ cargo test
 
 The command generates Codex `AGENTS.md`/TOML files, Claude Code `CLAUDE.md`/`.claude`/`.mcp.json` files, and Copilot Desktop `.github` instruction/agent files plus `.vscode/mcp.json`, then adds exact output paths to the repository-root `.gitignore`. Rules stay directly in `.agents/rules/`; subagents stay as YAML in `.agents/subagents/`. See the [Codex workflow](docs/codex.md), [Claude Code adapter](docs/claude.md), and [Copilot Desktop workflow](docs/copilot-desktop.md). It refuses to replace existing unowned, modified, or Git-tracked outputs.
 
-Run `cargo install --path .` to put `rai` on your `PATH`. Then `rai init` creates a starter `.agents/rules/general.md`, `rai status` previews drift, and `rai doctor` reports configuration problems. `rai setup --root /path/to/workspace` registers a workspace for polling and, on macOS, installs a per-user launchd watcher. It also configures Git hooks for future clones when no global hook path or custom template directory is already configured. Setup is not run automatically by installation. On other platforms, run the internal `rai watch` process manually for now.
+Run `cargo install --path .` to build and install `rai` from this checkout. Then `rai init` creates a starter `.agents/rules/general.md`, `rai status` previews drift, and `rai doctor` reports configuration problems. `rai setup --root /path/to/workspace` registers a workspace for polling and, on macOS, installs a per-user launchd watcher. It also configures Git hooks for future clones when no global hook path or custom template directory is already configured. Setup is not run automatically by installation. On other platforms, run the internal `rai watch` process manually for now.
 
 Every normal command warns at the end when a newer stable GitHub Release is available, using a one-hour cache. The check requires `curl` and a network connection.
 

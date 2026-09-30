@@ -4,6 +4,10 @@ Notable changes to the `rai` CLI are recorded here.
 
 ## Unreleased
 
+### Added
+
+- A macOS and Linux installer script for verified prebuilt GitHub releases.
+
 ## 0.2.0 - 2026-09-30
 
 ### Added
