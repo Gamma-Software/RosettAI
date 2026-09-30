@@ -18,17 +18,18 @@ RosettAI's proposed model stores canonical resources in `.agents/`, validates th
 
 ## Install the prebuilt CLI
 
-On macOS or Linux, run:
+On macOS, Linux, WSL, or Git Bash on Windows, run:
 
 ```sh
 curl -fsSL https://rai.pival.fr | bash
 ```
 
 The script downloads the latest stable release for your platform, verifies its
-SHA-256 checksum, and installs `rai` in a user-owned directory. It reuses an
-existing `~/.cargo/bin/rai` or `~/.local/bin/rai` location; otherwise it uses
-`~/.local/bin`. Set `RAI_INSTALL_DIR` to choose another directory. The script
-prints a PATH hint when needed. No Rust toolchain or local build is required.
+SHA-256 checksum, and installs `rai` in a user-owned directory. On Unix and WSL,
+it reuses an existing `~/.cargo/bin/rai` or `~/.local/bin/rai` location;
+otherwise it uses `~/.local/bin`. On Git Bash, it invokes the Windows PowerShell
+installer below, which installs `rai.exe`. Set `RAI_INSTALL_DIR` to choose
+another directory. No Rust toolchain or local build is required.
 On Windows, run this in PowerShell:
 
 ```powershell

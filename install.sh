@@ -9,15 +9,28 @@ fail() {
 }
 
 command -v curl >/dev/null 2>&1 || fail "curl is required"
-command -v tar >/dev/null 2>&1 || fail "tar is required"
 
-case "$(uname -s):$(uname -m)" in
+system=$(uname -s)
+machine=$(uname -m)
+case "$system:$machine" in
+  MINGW*:* | MSYS*:* | CYGWIN*:*)
+    if command -v powershell.exe >/dev/null 2>&1; then
+      powershell=powershell.exe
+    elif command -v pwsh.exe >/dev/null 2>&1; then
+      powershell=pwsh.exe
+    else
+      fail "PowerShell is required to install rai on Windows"
+    fi
+    exec "$powershell" -NoProfile -Command \
+      "irm 'https://raw.githubusercontent.com/Gamma-Software/RosettAI/main/install.ps1' | iex"
+    ;;
   Darwin:arm64) target="aarch64-apple-darwin" ;;
   Darwin:x86_64) target="x86_64-apple-darwin" ;;
   Linux:aarch64 | Linux:arm64) target="aarch64-unknown-linux-gnu" ;;
   Linux:x86_64) target="x86_64-unknown-linux-gnu" ;;
-  *) fail "no prebuilt rai release for $(uname -s)/$(uname -m)" ;;
+  *) fail "no prebuilt rai release for $system/$machine" ;;
 esac
+command -v tar >/dev/null 2>&1 || fail "tar is required"
 
 release_url=$(curl --fail --location --silent --show-error --retry 3 \
   --output /dev/null --write-out '%{url_effective}' "$repo_url/releases/latest") \

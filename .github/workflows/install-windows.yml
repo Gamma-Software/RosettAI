@@ -3,10 +3,12 @@ name: Windows installer
 on:
   push:
     paths:
+      - install.sh
       - install.ps1
       - .github/workflows/install-windows.yml
   pull_request:
     paths:
+      - install.sh
       - install.ps1
       - .github/workflows/install-windows.yml
 
@@ -15,6 +17,16 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install from Git Bash
+        shell: bash
+        run: bash ./install.sh
+      - name: Verify Git Bash installation
+        shell: pwsh
+        run: |
+          $binary = Join-Path $env:LOCALAPPDATA 'Programs\rai\rai.exe'
+          if (-not (Test-Path $binary -PathType Leaf)) {
+            throw 'Git Bash did not install rai.exe'
+          }
       - name: Install prebuilt CLI
         shell: pwsh
         run: |
