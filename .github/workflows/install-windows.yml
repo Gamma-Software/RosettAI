@@ -1,0 +1,24 @@
+name: Windows installer
+
+on:
+  push:
+    paths:
+      - install.ps1
+      - .github/workflows/install-windows.yml
+  pull_request:
+    paths:
+      - install.ps1
+      - .github/workflows/install-windows.yml
+
+jobs:
+  install:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install prebuilt CLI
+        shell: pwsh
+        run: |
+          $env:RAI_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'rai-install-test'
+          & ./install.ps1
+          & (Join-Path $env:RAI_INSTALL_DIR 'rai.exe') --version
+          rai --version

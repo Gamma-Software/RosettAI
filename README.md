@@ -29,7 +29,17 @@ SHA-256 checksum, and installs `rai` in a user-owned directory. It reuses an
 existing `~/.cargo/bin/rai` or `~/.local/bin/rai` location; otherwise it uses
 `~/.local/bin`. Set `RAI_INSTALL_DIR` to choose another directory. The script
 prints a PATH hint when needed. No Rust toolchain or local build is required.
-Windows users can download the prebuilt ZIP from [GitHub Releases](https://github.com/Gamma-Software/RosettAI/releases/latest).
+On Windows, run this in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Gamma-Software/RosettAI/main/install.ps1 | iex
+```
+
+The PowerShell script downloads the prebuilt Windows ZIP, verifies its SHA-256
+checksum, installs `rai.exe` in `%LOCALAPPDATA%\Programs\rai` by default, and
+adds that directory to your user PATH. Set `RAI_INSTALL_DIR` to choose another
+directory. Open a new terminal after installation. No Rust toolchain or local
+build is required.
 
 ## Try the Rust proof of concept
 
