@@ -161,7 +161,7 @@ pub fn outputs(root: &Path) -> Result<Vec<(String, String)>, String> {
     Ok(result)
 }
 
-fn read_subagents(root: &Path) -> Result<Vec<Value>, String> {
+pub fn read_subagents(root: &Path) -> Result<Vec<Value>, String> {
     let mut subagents = Vec::new();
     let agents_dir = root.join(".agents/subagents");
     if agents_dir.exists() {
@@ -237,7 +237,7 @@ fn read_subagents(root: &Path) -> Result<Vec<Value>, String> {
     Ok(subagents)
 }
 
-fn validate_skills(root: &Path) -> Result<(), String> {
+pub fn validate_skills(root: &Path) -> Result<(), String> {
     let dir = root.join(".agents/skills");
     if !dir.exists() {
         return Ok(());

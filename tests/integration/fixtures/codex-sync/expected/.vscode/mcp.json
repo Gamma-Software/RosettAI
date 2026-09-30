@@ -1,0 +1,24 @@
+// rai-generated sha256:548e23a8d3c96864c4656497873b9616ea9489f48de9986050eb3e0dfe0928fb
+{
+  "servers": {
+    "docs": {
+      "headers": {
+        "Authorization": "Bearer ${env:DOCS_TOKEN}"
+      },
+      "type": "http",
+      "url": "https://example.invalid/mcp"
+    },
+    "local": {
+      "args": [
+        "-y",
+        "example-mcp"
+      ],
+      "command": "npx",
+      "cwd": "tools",
+      "env": {
+        "LOCAL_TOKEN": "${env:LOCAL_TOKEN}"
+      },
+      "type": "stdio"
+    }
+  }
+}

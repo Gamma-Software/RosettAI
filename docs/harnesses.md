@@ -1,6 +1,6 @@
 # AI coding-agent harnesses
 
-> Research inventory only. The current `rai` implementation targets Codex exclusively; entries below are not implemented adapters.
+> Research inventory. `rai` currently has Codex, Claude Code, and GitHub Copilot Desktop adapters; other entries are not implemented.
 
 Last reviewed: 2026-09-24.
 

@@ -1,0 +1,23 @@
+{
+  "_rai_generated_sha256": "312f8a0e6b5380286409507fbb32af3a3b5a79840984b1524cd0d9ef032fcb68",
+  "mcpServers": {
+    "docs": {
+      "headers": {
+        "Authorization": "Bearer ${DOCS_TOKEN}"
+      },
+      "type": "http",
+      "url": "https://example.invalid/mcp"
+    },
+    "local": {
+      "args": [
+        "-y",
+        "example-mcp"
+      ],
+      "command": "npx",
+      "env": {
+        "LOCAL_TOKEN": "${LOCAL_TOKEN}"
+      },
+      "type": "stdio"
+    }
+  }
+}

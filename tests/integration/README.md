@@ -1,6 +1,8 @@
-# Codex sync integration coverage
+# Harness sync integration coverage
 
 Run `cargo test --test codex_sync` from the repository root. The example under `fixtures/codex-sync/input/` is a fresh project containing only `.agents/`. `fixtures/codex-sync/expected/` shows its complete tree after synchronization, including unchanged canonical files and generated Codex files. The one naming exception is `.gitignore.expected`: its contents are the generated `.gitignore`, but keeping the expected file under that name prevents Git from ignoring the other expected projections. The snapshot test copies the input to a temporary directory, runs the built `rai` binary, and compares every resulting file byte-for-byte with `expected/`.
+
+Run `cargo test --test copilot_sync` for the dedicated GitHub Copilot Desktop adapter suite. It verifies global and `applyTo`-scoped instructions, custom agents, HTTP and STDIO MCP projection, omission of Codex-only agent fields, skills read in place, idempotence, cleanup, and collision handling.
 
 The other tests invoke the built `rai` binary against isolated temporary repositories. Most require a Codex CLI on `PATH` at version 0.152.1 or newer; the version-gate test injects a local stub instead. They do not use network access or a real Codex session.
 

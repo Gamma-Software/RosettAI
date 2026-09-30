@@ -6,12 +6,13 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+mod claude;
 mod codex;
+mod copilot;
 mod perf;
 mod setup;
 
 const CODEX: &str = "AGENTS.md";
-const LEGACY_CLAUDE: &str = "CLAUDE.md";
 const LEGACY_CURSOR: &str = ".cursor/rules/rosettai.mdc";
 const IGNORE_START: &str = "# RosettAI generated files";
 const IGNORE_END: &str = "# End RosettAI generated files";
@@ -269,7 +270,7 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
     let rules = read_rules(root)?;
     codex::check_version()?;
     let mut outputs = rules
-        .into_iter()
+        .iter()
         .map(|(scope, sections)| {
             let relative = if scope.is_empty() {
                 CODEX.to_string()
@@ -277,11 +278,27 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
                 format!("{scope}/{CODEX}")
             };
             let body = format!("# Shared project rules\n\n{}\n", sections.join("\n\n"));
-            (relative, owned(&body, ""), "".to_string())
+            (relative, owned(&body, ""), "markdown".to_string())
         })
         .collect::<Vec<_>>();
     for (path, body) in codex::outputs(root)? {
-        outputs.push((path, owned_comment(&body), "#".to_string()));
+        outputs.push((path, owned_comment(&body), "hash".to_string()));
+    }
+    for (path, body, kind) in copilot::outputs(root, &rules)? {
+        let content = if kind == "jsonc" {
+            owned_slash_comment(&body)
+        } else {
+            owned(&body, "")
+        };
+        outputs.push((path, content, kind));
+    }
+    for (path, body, kind) in claude::outputs(root, &rules)? {
+        let content = if kind == "json" {
+            owned_json(&body)?
+        } else {
+            owned(&body, "")
+        };
+        outputs.push((path, content, kind));
     }
 
     // Plan every write before applying any of them. A single collision aborts the sync.
@@ -303,10 +320,11 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         let action = if path.exists() {
             let current =
                 fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let valid = if marker == "#" {
-                is_owned_comment(&current)
-            } else {
-                is_owned(&current, &marker)
+            let valid = match marker.as_str() {
+                "hash" => is_owned_comment(&current),
+                "jsonc" => is_owned_slash_comment(&current),
+                "json" => is_owned_json(&current),
+                _ => is_owned(&current, ""),
             };
             if !valid {
                 return Err(format!("unowned or modified output conflict: {relative}"));
@@ -361,10 +379,65 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         }
     }
 
-    for (relative, prefix) in [
-        (LEGACY_CLAUDE, ""),
-        (LEGACY_CURSOR, LEGACY_CURSOR_FRONTMATTER),
+    for directory in [
+        ".github/agents",
+        ".github/instructions",
+        ".claude/agents",
+        ".claude/rules",
+        ".claude/skills",
     ] {
+        let dir = root.join(directory);
+        if dir.is_symlink() {
+            return Err(format!("symlink output conflict: {directory}"));
+        }
+        if dir.is_dir() {
+            for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                if path.is_symlink() {
+                    return Err(format!("symlink output conflict: {}", path.display()));
+                }
+                if path.is_file() && !changes.iter().any(|change| change.path == path) {
+                    let relative = path
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned();
+                    if !is_tracked(root, &relative)? {
+                        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                        if is_owned(&content, "") {
+                            changes.push(Change {
+                                path: path.clone(),
+                                content: String::new(),
+                                action: Action::Delete,
+                            });
+                        }
+                    }
+                }
+                if directory == ".claude/skills" && path.is_dir() {
+                    let skill = path.join("SKILL.md");
+                    if skill.is_file() && !changes.iter().any(|change| change.path == skill) {
+                        let relative = skill
+                            .strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned();
+                        if !is_tracked(root, &relative)? {
+                            let content = fs::read_to_string(&skill).map_err(|e| e.to_string())?;
+                            if is_owned(&content, "") {
+                                changes.push(Change {
+                                    path: skill,
+                                    content: String::new(),
+                                    action: Action::Delete,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for (relative, prefix) in [(LEGACY_CURSOR, LEGACY_CURSOR_FRONTMATTER)] {
         let path = root.join(relative);
         if path.is_symlink()
             || path
@@ -395,7 +468,7 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
     } else {
         String::new()
     };
-    for relative in managed_instruction_paths(&old_ignore)? {
+    for relative in managed_output_paths(&old_ignore)? {
         let path = root.join(&relative);
         if changes.iter().any(|change| change.path == path) || is_tracked(root, &relative)? {
             continue;
@@ -409,7 +482,11 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
             continue;
         }
         let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        if is_owned(&content, "") {
+        if is_owned(&content, "")
+            || is_owned_comment(&content)
+            || is_owned_slash_comment(&content)
+            || is_owned_json(&content)
+        {
             changes.push(Change {
                 path,
                 content: String::new(),
@@ -882,7 +959,7 @@ fn parse_rule(content: &str) -> Result<(String, &str), String> {
     Ok((scope, body))
 }
 
-fn managed_instruction_paths(ignore: &str) -> Result<Vec<String>, String> {
+fn managed_output_paths(ignore: &str) -> Result<Vec<String>, String> {
     let Some(start) = ignore.find(IGNORE_START) else {
         return Ok(Vec::new());
     };
@@ -898,10 +975,9 @@ fn managed_instruction_paths(ignore: &str) -> Result<Vec<String>, String> {
             continue;
         };
         let candidate = Path::new(relative);
-        if candidate.file_name().is_some_and(|name| name == CODEX)
-            && candidate
-                .components()
-                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        if candidate
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
         {
             paths.push(relative.to_owned());
         }
@@ -940,6 +1016,52 @@ fn is_owned_comment(content: &str) -> bool {
         return false;
     };
     hash.len() == 64 && hash == format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
+fn owned_slash_comment(body: &str) -> String {
+    let hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+    format!("// rai-generated sha256:{hash}\n{body}")
+}
+
+fn is_owned_slash_comment(content: &str) -> bool {
+    let Some(rest) = content.strip_prefix("// rai-generated sha256:") else {
+        return false;
+    };
+    let Some((hash, body)) = rest.split_once('\n') else {
+        return false;
+    };
+    hash.len() == 64 && hash == format!("{:x}", Sha256::digest(body.as_bytes()))
+}
+
+fn owned_json(body: &str) -> Result<String, String> {
+    let mut value: serde_json::Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let hash = format!("{:x}", Sha256::digest(body.as_bytes()));
+    value
+        .as_object_mut()
+        .ok_or("JSON projection must be an object")?
+        .insert("_rai_generated_sha256".into(), hash.into());
+    serde_json::to_string_pretty(&value)
+        .map(|s| format!("{s}\n"))
+        .map_err(|e| e.to_string())
+}
+
+fn is_owned_json(content: &str) -> bool {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(content) else {
+        return false;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return false;
+    };
+    let Some(hash) = object
+        .remove("_rai_generated_sha256")
+        .and_then(|v| v.as_str().map(str::to_owned))
+    else {
+        return false;
+    };
+    let Ok(body) = serde_json::to_string_pretty(&value) else {
+        return false;
+    };
+    hash == format!("{:x}", Sha256::digest(format!("{body}\n").as_bytes()))
 }
 
 fn is_tracked(root: &Path, path: &str) -> Result<bool, String> {
@@ -1010,7 +1132,7 @@ mod tests {
         assert!(agents.contains("Prefer clear names."));
         assert!(is_owned(&agents, ""));
         assert!(is_owned_comment(&config));
-        assert!(!dir.path().join(LEGACY_CLAUDE).exists());
+        assert!(dir.path().join("CLAUDE.md").exists());
         assert!(!dir.path().join(LEGACY_CURSOR).exists());
         let ignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
         sync(dir.path(), false).unwrap();
@@ -1148,10 +1270,10 @@ mod tests {
     fn removes_only_owned_legacy_outputs() {
         let dir = repo();
         fs::create_dir_all(dir.path().join(".cursor/rules")).unwrap();
-        fs::write(dir.path().join(LEGACY_CLAUDE), owned("legacy\n", "")).unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), owned("legacy\n", "")).unwrap();
         fs::write(dir.path().join(LEGACY_CURSOR), "manual rule\n").unwrap();
         sync(dir.path(), false).unwrap();
-        assert!(!dir.path().join(LEGACY_CLAUDE).exists());
+        assert!(dir.path().join("CLAUDE.md").exists());
         assert_eq!(
             fs::read_to_string(dir.path().join(LEGACY_CURSOR)).unwrap(),
             "manual rule\n"

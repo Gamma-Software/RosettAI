@@ -1,8 +1,8 @@
 # RosettAI
 
-RosettAI synchronizes canonical AI-agent resources from `.agents/` into Codex's native project configuration. Other harnesses remain future research, not supported outputs.
+RosettAI synchronizes canonical AI-agent resources from `.agents/` into native Codex, Claude Code, and GitHub Copilot Desktop project configuration.
 
-The project is in an early proof-of-concept phase. The Rust CLI implements `setup`, `init`, `status`, `sync`, and `doctor` for Codex rules, YAML subagents, and MCP. Codex reads canonical skills in place. Directory-scoped rules are supported; native-file migration remains a design proposal.
+The project is in an early proof-of-concept phase. The Rust CLI implements `setup`, `init`, `status`, `sync`, and `doctor` for rules, YAML subagents, skills, and MCP. Codex and Copilot read canonical skills in place. Directory-scoped rules are supported; native-file migration remains a design proposal.
 
 ## Product values
 
@@ -26,7 +26,7 @@ cargo run -- sync --repo /path/to/test-repo
 cargo test
 ```
 
-The command generates root or directory-scoped `AGENTS.md` files, `.codex/config.toml`, and `.codex/agents/*.toml`, then adds exact output paths to the repository-root `.gitignore`. Rules stay directly in `.agents/rules/`; an optional `path: frontend` Markdown frontmatter field projects a rule to `frontend/AGENTS.md`. Subagents are authored as YAML in `.agents/subagents/`. See the [Codex workflow](docs/codex.md). It refuses to replace existing unowned, modified, or Git-tracked outputs. Native-file migration is not supported; use a test repository because existing native files cause a reported conflict rather than being imported.
+The command generates Codex `AGENTS.md`/TOML files, Claude Code `CLAUDE.md`/`.claude`/`.mcp.json` files, and Copilot Desktop `.github` instruction/agent files plus `.vscode/mcp.json`, then adds exact output paths to the repository-root `.gitignore`. Rules stay directly in `.agents/rules/`; subagents stay as YAML in `.agents/subagents/`. See the [Codex workflow](docs/codex.md), [Claude Code adapter](docs/claude.md), and [Copilot Desktop workflow](docs/copilot-desktop.md). It refuses to replace existing unowned, modified, or Git-tracked outputs.
 
 Run `cargo install --path .` to put `rai` on your `PATH`. Then `rai init` creates a starter `.agents/rules/general.md`, `rai status` previews drift, and `rai doctor` reports configuration problems. `rai setup --root /path/to/workspace` registers a workspace for polling and, on macOS, installs a per-user launchd watcher. It also configures Git hooks for future clones when no global hook path or custom template directory is already configured. Setup is not run automatically by installation. On other platforms, run the internal `rai watch` process manually for now.
 

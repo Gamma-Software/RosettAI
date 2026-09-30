@@ -1,8 +1,8 @@
-# Tests Codex dans Docker
+# Tests Codex et GitHub Copilot dans Docker
 
-L'image fournit un environnement Codex vierge et reproductible pour tester
-RosettAI. Elle contient la CLI Codex, le binaire `rai`, Git et ripgrep. Elle
-s'exécute avec un utilisateur non privilégié.
+L'image fournit un environnement reproductible avec Codex CLI, GitHub Copilot
+CLI, VS Code Linux et son extension Copilot intégrée, ainsi que le binaire
+`rai`, Git et ripgrep. Elle s'exécute avec un utilisateur non privilégié.
 
 ## Construire l'image
 
@@ -15,6 +15,7 @@ Pour construire une autre version de Codex :
 ```sh
 docker build \
   --build-arg CODEX_VERSION=0.158.0 \
+  --build-arg COPILOT_VERSION=1.0.89 \
   -f tests/docker-images/Dockerfile.codex \
   -t rosettai-codex:0.158.0 .
 ```
@@ -30,6 +31,43 @@ docker run --rm rosettai-codex:0.158.0
 ```
 
 Ce test ne consomme aucune requête API.
+
+## Tester GitHub Copilot
+
+Le test statique vérifie que Copilot CLI et VS Code sont installés, que Copilot
+Chat est inclus dans VS Code, puis que `rai sync` produit les instructions et
+l'agent Copilot attendus :
+
+```sh
+docker run --rm rosettai-codex:0.158.0 copilot-smoke
+```
+
+Pour vérifier que Copilot CLI charge réellement les instructions projet, passez
+un jeton GitHub autorisé pour Copilot à l'exécution :
+
+```sh
+docker run --rm -e COPILOT_GITHUB_TOKEN rosettai-codex:0.158.0 copilot-smoke --live
+```
+
+Le test live effectue une requête Copilot et vérifie un marqueur présent dans les
+instructions projet. Il accepte aussi `GH_TOKEN` ou `GITHUB_TOKEN`.
+
+Pour ouvrir VS Code et Copilot Desktop dans le conteneur, montez le dépôt et
+publiez VNC uniquement sur la machine locale :
+
+```sh
+docker run --rm -it \
+  -p 127.0.0.1:5900:5900 \
+  -v "$PWD:/workspace" \
+  -v copilot-desktop-config:/home/node/.config/Code \
+  rosettai-codex:0.158.0 copilot-desktop
+```
+
+Ouvrez `vnc://localhost:5900` avec un client VNC, connectez-vous à GitHub dans
+VS Code, puis ouvrez Copilot Chat > Diagnostics pour vérifier les fichiers
+projet chargés. Exécutez `rai sync --repo /workspace` avant d'ouvrir le dépôt
+si ses projections ne sont pas encore présentes. La connexion VNC n'a pas de
+mot de passe : conservez la publication sur `127.0.0.1`.
 
 ## Tester le chargement réel du skill
 
@@ -79,4 +117,8 @@ docker run --rm \
 docker run --rm rosettai-codex:0.158.0 codex --version
 
 docker run --rm rosettai-codex:0.158.0 sh -c 'command -v rai'
+
+docker run --rm rosettai-codex:0.158.0 copilot --version
+
+docker run --rm rosettai-codex:0.158.0 code --version
 ```
