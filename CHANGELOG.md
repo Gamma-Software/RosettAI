@@ -4,6 +4,15 @@ Notable changes to the `rai` CLI are recorded here.
 
 ## Unreleased
 
+## 0.2.0 - 2026-09-30
+
+### Added
+
+- An automatic update warning at the end of CLI commands, with a one-hour cache
+  and a short network timeout.
+- `rai update` to install the latest stable platform release after SHA-256
+  verification.
+
 ## 0.1.0 - 2026-09-30
 
 ### Added

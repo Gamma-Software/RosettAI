@@ -3,6 +3,94 @@ use std::io::Write;
 use std::process::Command;
 use std::process::Stdio;
 
+#[cfg(unix)]
+#[test]
+fn update_installs_verified_release_archive() {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let installed = dir.path().join("rai");
+    fs::copy(env!("CARGO_BIN_EXE_rai"), &installed).unwrap();
+    let source = dir.path().join("source");
+    let bin = dir.path().join("bin");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&bin).unwrap();
+    let replacement = source.join("rai");
+    fs::write(&replacement, b"updated rai fixture").unwrap();
+    fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+    let archive = dir.path().join("archive.tar.gz");
+    assert!(
+        Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .args(["-C"])
+            .arg(&source)
+            .arg("rai")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let target = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        _ => return,
+    };
+    let hash = format!("{:x}", Sha256::digest(fs::read(&archive).unwrap()));
+    fs::write(
+        dir.path().join("SHA256SUMS"),
+        format!("{hash}  rai-v999.0.0-{target}.tar.gz\n"),
+    )
+    .unwrap();
+    let fake_curl = bin.join("curl");
+    fs::write(
+        &fake_curl,
+        "#!/bin/sh\ndestination=\nprevious=\nfor arg in \"$@\"; do\n  if [ \"$previous\" = --output ]; then destination=$arg; fi\n  previous=$arg\n  url=$arg\ndone\ncase \"$url\" in\n  */releases/latest) printf '{\"tag_name\":\"v999.0.0\"}' ;;\n  */SHA256SUMS) cp \"$RAI_TEST_RELEASE_DIR/SHA256SUMS\" \"$destination\" ;;\n  *.tar.gz) cp \"$RAI_TEST_RELEASE_DIR/archive.tar.gz\" \"$destination\" ;;\n  *) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake_curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let output = Command::new(&installed)
+        .arg("update")
+        .env("PATH", path)
+        .env("XDG_CACHE_HOME", dir.path().join("cache"))
+        .env("RAI_TEST_RELEASE_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(installed).unwrap(), b"updated rai fixture");
+}
+
+#[test]
+fn update_warning_appears_after_command_without_changing_json() {
+    let cache = tempfile::tempdir().unwrap();
+    let cache_file = cache.path().join("rai/latest-release");
+    fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+    fs::write(cache_file, "v999.0.0").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["doctor", "--json", "--repo"])
+        .arg(cache.path())
+        .env("XDG_CACHE_HOME", cache.path())
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(serde_json::from_slice::<serde_json::Value>(&result.stdout).is_ok());
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr
+            .lines()
+            .last()
+            .unwrap()
+            .contains("Warning: rai v999.0.0 is available")
+    );
+}
+
 fn invoke_codex_hook(repo: &std::path::Path) -> std::process::Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
         .args(["sync", "--codex-hook", "--repo"])

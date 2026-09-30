@@ -22,6 +22,11 @@ For a new repository, run `rai init` once to create a minimal `.agents/` source 
 | `rai status` | See the state of generated configuration and any drift. | `--repo <path>`, `--json` |
 | `rai sync` | Project Codex configuration now, or act as a Codex prompt guard. | `--repo <path>`, `--dry-run`, `--json`, `--codex-hook` |
 | `rai doctor` | Explain each issue and offer interactive fixes where safe. | `--repo <path>`, `--json` |
+| `rai update` | Download, verify, and install the latest stable CLI release. | None |
+
+`rai update` downloads the release archive for the current platform and `SHA256SUMS`, verifies the archive's SHA-256, then replaces the running CLI executable. On Windows, a background PowerShell process finishes replacement after `rai` exits. The command needs write permission in the executable's directory and supports only the platforms published by the release workflow. It does not update Cargo's installation metadata; a later `cargo install --path .` can replace the downloaded binary.
+
+Every normal `rai` invocation also checks for a newer stable release and prints a yellow warning at the end when one exists. The automatic check uses a one-hour cache and a two-second network timeout; connection failures do not affect the command. Warnings go to stderr, leaving `--json` output on stdout intact. The long-running internal `rai watch` process checks when it exits; `rai update` always requests a fresh result.
 
 In a terminal, `rai doctor` lists each issue with a proposed solution, then asks whether to fix a numbered issue, fix **all automatically fixable** issues, or do nothing. It can initialize missing `.agents/`, run `rai sync` for drift, or rerun `rai setup` for a missing watcher/configuration. It never moves or overwrites unmanaged native instructions automatically; those issues include manual steps. After a fix it checks again. `rai doctor --json` and non-interactive runs never prompt; JSON issues include `message`, `solution`, and `autoFixable`.
 

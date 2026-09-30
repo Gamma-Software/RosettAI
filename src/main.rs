@@ -11,6 +11,7 @@ mod codex;
 mod copilot;
 mod perf;
 mod setup;
+mod update;
 
 const CODEX: &str = "AGENTS.md";
 const LEGACY_CURSOR: &str = ".cursor/rules/rosettai.mdc";
@@ -36,6 +37,7 @@ struct Change {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    let is_update = args.first().is_some_and(|arg| arg == "update");
     let snapshot = args
         .iter()
         .any(|arg| arg == "--perf")
@@ -46,6 +48,9 @@ fn main() -> ExitCode {
     }
     if let Some(snapshot) = snapshot {
         snapshot.emit();
+    }
+    if !is_update {
+        update::automatic_warning();
     }
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -94,6 +99,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if command == "setup" {
         return setup::setup(roots);
     }
+    if command == "update" {
+        if repo.is_some() || codex_hook || json {
+            return Err("update accepts only --perf".into());
+        }
+        return update::install();
+    }
     if command == "watch" {
         if repo.is_some() || dry_run || json {
             return Err("watch takes no options".into());
@@ -130,7 +141,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: rai <setup|init|status|sync|doctor> [--repo PATH] [--root PATH] [--dry-run] [--json] [--codex-hook] [--perf]"
+    "usage: rai <setup|init|status|sync|doctor|update> [--repo PATH] [--root PATH] [--dry-run] [--json] [--codex-hook] [--perf]"
         .into()
 }
 
