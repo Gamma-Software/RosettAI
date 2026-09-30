@@ -26,8 +26,15 @@ try {
     $checksumsPath = Join-Path $workDir 'SHA256SUMS'
     $archivePath = Join-Path $workDir $archive
     Invoke-WebRequest -Uri "$baseUrl/SHA256SUMS" -OutFile $checksumsPath -UseBasicParsing
-    Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile $archivePath -UseBasicParsing
+    Write-Host "Downloading $archive..."
+    $ProgressPreference = 'Continue'
+    try {
+        Invoke-WebRequest -Uri "$baseUrl/$archive" -OutFile $archivePath -UseBasicParsing
+    } finally {
+        $ProgressPreference = 'SilentlyContinue'
+    }
 
+    Write-Host 'Verifying SHA-256...'
     $checksumMatches = @(Get-Content $checksumsPath | ForEach-Object {
         if ($_ -match '^([0-9a-fA-F]{64})\s+\*?(.+)$' -and $Matches[2] -ceq $archive) {
             $Matches[1]
@@ -41,6 +48,7 @@ try {
         Fail "SHA-256 mismatch for $archive"
     }
 
+    Write-Host 'Installing rai...'
     $unpackDir = Join-Path $workDir 'unpack'
     Expand-Archive -Path $archivePath -DestinationPath $unpackDir
     $binary = Join-Path $unpackDir 'rai.exe'

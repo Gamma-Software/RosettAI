@@ -56,10 +56,16 @@ trap cleanup EXIT
 curl --fail --location --silent --show-error --retry 3 \
   --output "$work_dir/SHA256SUMS" "$download_url/SHA256SUMS" \
   || fail "cannot download SHA256SUMS"
-curl --fail --location --silent --show-error --retry 3 \
+printf 'Downloading %s...\n' "$archive"
+curl_progress=(--silent --show-error)
+if [[ -t 2 ]]; then
+  curl_progress=(--progress-bar)
+fi
+curl --fail --location "${curl_progress[@]}" --retry 3 \
   --output "$work_dir/$archive" "$download_url/$archive" \
   || fail "cannot download $archive"
 
+printf 'Verifying SHA-256...\n'
 expected=$(awk -v name="$archive" '$2 == name {print $1}' "$work_dir/SHA256SUMS")
 [[ "$expected" =~ ^[[:xdigit:]]{64}$ ]] \
   || fail "SHA256SUMS has no unique valid entry for $archive"
@@ -72,6 +78,7 @@ else
 fi
 [[ "$actual" == "$expected" ]] || fail "SHA-256 mismatch for $archive"
 
+printf 'Installing rai...\n'
 tar -xzf "$work_dir/$archive" -C "$work_dir" rai \
   || fail "cannot extract rai from $archive"
 [[ -f "$work_dir/rai" && ! -L "$work_dir/rai" && -x "$work_dir/rai" ]] \
