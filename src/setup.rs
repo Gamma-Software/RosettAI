@@ -453,7 +453,7 @@ pub fn diagnostics() -> Vec<Diagnostic> {
     }
     #[cfg(target_os = "linux")]
     {
-        if systemd_user_dir().is_err_or(|dir| !dir.join("rai-watch.service").exists()) {
+        if systemd_user_dir().map_or(true, |dir| !dir.join("rai-watch.service").exists()) {
             issues.push(Diagnostic::WatcherMissing);
         }
     }

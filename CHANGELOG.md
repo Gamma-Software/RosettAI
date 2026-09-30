@@ -4,7 +4,7 @@ Notable changes to the `rai` CLI are recorded here.
 
 ## Unreleased
 
-## 0.3.0 - 2026-09-30
+## 0.3.1 - 2026-09-30
 
 ### Added
 
