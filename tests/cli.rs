@@ -323,6 +323,9 @@ fn setup_installs_isolated_hook_that_syncs_a_repo() {
     let launchctl = bin.join("launchctl");
     fs::write(&launchctl, "#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let systemctl = bin.join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
 
     let workspace = sandbox.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
@@ -351,6 +354,14 @@ fn setup_installs_isolated_hook_that_syncs_a_repo() {
     assert!(hook.exists());
     let saved = fs::read_to_string(sandbox.path().join("config/rai/roots.txt")).unwrap();
     assert!(saved.contains(&workspace.to_string_lossy().to_string()));
+    #[cfg(target_os = "linux")]
+    {
+        let service =
+            fs::read_to_string(sandbox.path().join("config/systemd/user/rai-watch.service"))
+                .unwrap();
+        assert!(service.starts_with("# rai-managed-watcher\n"));
+        assert!(service.contains(&format!("ExecStart=\"{}\" watch", rai.display())));
+    }
 
     let repo = workspace.join("example");
     fs::create_dir_all(repo.join(".agents/rules")).unwrap();

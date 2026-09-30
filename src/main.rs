@@ -645,7 +645,7 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
         let (message, solution, fix) = match issue {
             setup::Diagnostic::ConfigUnavailable => (
                 "cannot locate per-user setup configuration".into(),
-                "Set HOME or XDG_CONFIG_HOME, then run rai setup --root PATH.".into(),
+                "Set the user configuration directory (HOME or XDG_CONFIG_HOME on Unix, APPDATA on Windows), then run rai setup --root PATH.".into(),
                 None,
             ),
             setup::Diagnostic::ConfigUnreadable => (
@@ -668,7 +668,7 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
                 None,
             ),
             setup::Diagnostic::WatcherMissing => (
-                "watcher LaunchAgent is not installed".into(),
+                "watcher service is not installed".into(),
                 if can_setup { "Rerun rai setup with the existing workspace roots to reinstall the watcher.".into() } else { "Install rai with cargo install --path ., then rerun rai setup with the existing workspace roots.".into() },
                 can_setup.then_some(DoctorFix::SetupExisting),
             ),

@@ -4,7 +4,7 @@
 
 The current RosettAI implementation targets Codex, Claude Code, and GitHub Copilot Desktop.
 
-This document records the current design direction. A limited Rust CLI now implements `setup`, `init`, `status`, `sync`, and `doctor` for global and directory-scoped Markdown rules. Setup can install a macOS polling watcher and Git hooks for future clones; native-file migration and harness detection are not implemented. Where older architecture documents specify `.rosettai/` as the canonical directory or `rai run` as the primary activation path, this document supersedes those choices.
+This document records the current design direction. A limited Rust CLI now implements `setup`, `init`, `status`, `sync`, and `doctor` for global and directory-scoped Markdown rules. Setup can install a polling watcher on macOS, Linux, and Windows, plus Git hooks for future clones; native-file migration and harness detection are not implemented. Where older architecture documents specify `.rosettai/` as the canonical directory or `rai run` as the primary activation path, this document supersedes those choices.
 
 The proposed command interface is specified in [`cli.md`](cli.md).
 

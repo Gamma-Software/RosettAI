@@ -2,7 +2,7 @@
 
 `rai` is the local command-line interface for RosettAI. The Rust proof of concept implements `setup`, `init`, `status`, `sync`, `doctor`, and a Codex prompt guard. A team versions its configuration in `.agents/`, while RosettAI projects rules, subagents, skills, and MCP to Codex, Claude Code, and GitHub Copilot Desktop. Automatic migration of native files remains future work.
 
-Install the CLI with `cargo install --path .` before running `rai setup`. Setup registers workspace roots and a polling watcher; on macOS it installs a launchd agent. On other platforms, the watcher currently requires running `rai watch` manually. When Git has no global `core.hooksPath` or custom `init.templateDir`, setup installs hooks for future clones through a user-level template directory. It never replaces a configured global hook path or template directory.
+Install the CLI with `cargo install --path .` before running `rai setup`. Setup registers workspace roots and a polling watcher: a launchd agent on macOS, a systemd user service on Linux, or a per-user scheduled task on Windows. Linux requires a running systemd user manager. When Git has no global `core.hooksPath` or custom `init.templateDir`, setup installs hooks for future clones through a user-level template directory. It never replaces a configured global hook path or template directory.
 
 ## The normal path
 

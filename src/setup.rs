@@ -156,11 +156,19 @@ fn discover(root: &Path, depth: usize) -> Vec<PathBuf> {
 }
 
 fn config_dir() -> Result<PathBuf, String> {
-    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(xdg).join("rai"));
+    #[cfg(windows)]
+    {
+        let appdata = env::var_os("APPDATA").ok_or("APPDATA is not set")?;
+        return Ok(PathBuf::from(appdata).join("rai"));
     }
-    let home = env::var_os("HOME").ok_or("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".config/rai"))
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+            return Ok(PathBuf::from(xdg).join("rai"));
+        }
+        let home = env::var_os("HOME").ok_or("HOME is not set")?;
+        Ok(PathBuf::from(home).join(".config/rai"))
+    }
 }
 
 fn read_roots(config: &Path) -> Result<Vec<PathBuf>, String> {
@@ -323,11 +331,91 @@ fn install_watcher(_config: &Path, executable: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn install_watcher(_config: &Path, _executable: &Path) -> Result<(), String> {
-    println!(
-        "Watcher: automatic service installation is currently supported on macOS only; run `rai watch` manually"
-    );
+#[cfg(target_os = "linux")]
+fn install_watcher(_config: &Path, executable: &Path) -> Result<(), String> {
+    let services = systemd_user_dir()?;
+    fs::create_dir_all(&services).map_err(|e| format!("{}: {e}", services.display()))?;
+    let service = services.join("rai-watch.service");
+    if service.is_symlink() {
+        return Err(format!(
+            "symlink watcher service conflict: {}",
+            service.display()
+        ));
+    }
+    if service.exists()
+        && !fs::read_to_string(&service)
+            .map_err(|e| e.to_string())?
+            .starts_with("# rai-managed-watcher\n")
+    {
+        return Err(format!(
+            "unowned watcher service conflict: {}",
+            service.display()
+        ));
+    }
+    let escaped = executable
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    fs::write(&service, format!("# rai-managed-watcher\n[Unit]\nDescription=RosettAI workspace watcher\n\n[Service]\nExecStart=\"{escaped}\" watch\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"))
+        .map_err(|e| format!("{}: {e}", service.display()))?;
+    for args in [
+        vec!["--user", "daemon-reload"],
+        vec!["--user", "enable", "--now", "rai-watch.service"],
+        vec!["--user", "restart", "rai-watch.service"],
+    ] {
+        let output = Command::new("systemctl")
+            .args(&args)
+            .output()
+            .map_err(|e| format!("systemctl: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "systemctl {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+    }
+    println!("Watcher: started via systemd user service");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_dir() -> Result<PathBuf, String> {
+    if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+        return Ok(PathBuf::from(xdg).join("systemd/user"));
+    }
+    let home = env::var_os("HOME").ok_or("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".config/systemd/user"))
+}
+
+#[cfg(windows)]
+fn install_watcher(_config: &Path, executable: &Path) -> Result<(), String> {
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = 'Stop'
+$name = 'RosettAI Watcher'
+$existing = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+if ($existing -and $existing.Description -ne 'rai-managed-watcher') {
+    throw 'unowned watcher task conflict: RosettAI Watcher'
+}
+$action = New-ScheduledTaskAction -Execute $env:RAI_WATCH_EXECUTABLE -Argument 'watch'
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Seconds 0) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+Register-ScheduledTask -TaskName $name -Action $action -Trigger $trigger -Settings $settings -Description 'rai-managed-watcher' -Force | Out-Null
+Start-ScheduledTask -TaskName $name
+"#;
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .env("RAI_WATCH_EXECUTABLE", executable)
+        .output()
+        .map_err(|e| format!("PowerShell: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not install watcher task: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    println!("Watcher: started via Windows Task Scheduler");
     Ok(())
 }
 
@@ -360,6 +448,22 @@ pub fn diagnostics() -> Vec<Diagnostic> {
     if let Some(home) = env::var_os("HOME") {
         let plist = PathBuf::from(home).join("Library/LaunchAgents/ai.rosettai.rai.plist");
         if !plist.exists() {
+            issues.push(Diagnostic::WatcherMissing);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if systemd_user_dir().is_err_or(|dir| !dir.join("rai-watch.service").exists()) {
+            issues.push(Diagnostic::WatcherMissing);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let installed = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "(Get-ScheduledTask -TaskName 'RosettAI Watcher' -ErrorAction SilentlyContinue).Description"])
+            .output()
+            .is_ok_and(|output| output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "rai-managed-watcher");
+        if !installed {
             issues.push(Diagnostic::WatcherMissing);
         }
     }

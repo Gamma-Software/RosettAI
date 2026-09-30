@@ -4,9 +4,19 @@ Notable changes to the `rai` CLI are recorded here.
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-30
+
 ### Added
 
-- A macOS and Linux installer script for verified prebuilt GitHub releases.
+- Verified prebuilt installers for macOS, Linux, and Windows, including a Bash
+  entry point on Windows.
+- Automatic per-user watcher installation through systemd on Linux and Task
+  Scheduler on Windows.
+
+### Changed
+
+- `rai doctor` detects a missing watcher service on Linux and Windows.
+- Windows setup stores workspace roots in the user's `APPDATA` directory.
 
 ## 0.2.0 - 2026-09-30
 
