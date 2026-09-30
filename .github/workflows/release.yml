@@ -57,6 +57,20 @@ jobs:
           ref: ${{ inputs.tag || github.ref_name }}
       - name: Install Codex CLI for integration tests
         run: npm install --global @openai/codex@0.158.0
+      - name: Expose native Codex executable on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $globalRoot = (npm root --global).Trim()
+          $codex = Get-ChildItem -Path $globalRoot -Filter codex.exe -Recurse |
+            Where-Object { $_.FullName -like '*codex-win32-x64*' } |
+            Select-Object -First 1
+          if (-not $codex) { throw 'Native Codex executable not found' }
+          $bin = Join-Path $env:RUNNER_TEMP 'codex-bin'
+          New-Item -ItemType Directory -Path $bin | Out-Null
+          Copy-Item $codex.FullName (Join-Path $bin 'codex.exe')
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & (Join-Path $bin 'codex.exe') --version
       - name: Install Rust target
         run: rustup target add "${{ matrix.target }}"
       - name: Test
