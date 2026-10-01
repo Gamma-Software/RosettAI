@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const HOOK_MARKER: &str = "# rai-managed-hook";
 
@@ -49,7 +49,9 @@ pub fn setup(mut roots: Vec<PathBuf>) -> Result<(), String> {
         .components()
         .any(|component| component.as_os_str() == "target")
     {
-        return Err("install rai first with `cargo install --path .`, then run `rai setup`".into());
+        return Err(
+            "install rai first with `cargo install --path .`, then run `rai install`".into(),
+        );
     }
     let config = config_dir()?;
     if config.is_symlink() {
@@ -76,6 +78,7 @@ pub fn setup(mut roots: Vec<PathBuf>) -> Result<(), String> {
     }
     saved.sort();
     write_roots(&config, &saved)?;
+    crate::root_tracking::remember(&config, &saved)?;
     println!(
         "Watching {} workspace director{}",
         saved.len(),
@@ -89,12 +92,27 @@ pub fn setup(mut roots: Vec<PathBuf>) -> Result<(), String> {
 pub fn watch(perf: bool) -> Result<(), String> {
     let config = config_dir()?;
     let roots = read_roots(&config)?;
-    if roots.is_empty() {
-        return Err("no workspace roots configured; run rai setup --root PATH".into());
+    if roots.is_empty() && !config.join("roots.txt").exists() {
+        return Err("no workspace roots configured; run rai install --root PATH".into());
     }
+    let mut last_relocation_scan = None;
     loop {
         let snapshot = perf.then(crate::perf::Snapshot::start);
-        watch_once(&roots);
+        let current = read_roots(&config)?;
+        let scan = last_relocation_scan
+            .is_none_or(|last: Instant| last.elapsed() >= Duration::from_secs(300));
+        let (resolved, missing) =
+            crate::root_tracking::resolve_with_search(&config, &current, scan)?;
+        if scan {
+            last_relocation_scan = Some(Instant::now());
+            for root in missing {
+                eprintln!(
+                    "rai watch: configured workspace could not be found: {}",
+                    root.display()
+                );
+            }
+        }
+        watch_once(&resolved);
         if let Some(snapshot) = snapshot {
             snapshot.emit();
         }
@@ -108,6 +126,10 @@ pub fn repair_existing() -> Result<(), String> {
         return Err("no workspace roots configured".into());
     }
     setup(roots)
+}
+
+pub fn change_workspace(old: &Path, replacement: Option<&Path>) -> Result<(), String> {
+    crate::root_tracking::change_root(&config_dir()?, old, replacement)
 }
 
 fn watch_once(roots: &[PathBuf]) {
@@ -435,14 +457,15 @@ pub fn diagnostics() -> Vec<Diagnostic> {
     let Ok(roots) = read_roots(&config) else {
         return vec![Diagnostic::ConfigUnreadable];
     };
-    if roots.is_empty() {
+    if roots.is_empty() && !config.join("roots.txt").exists() {
         return vec![Diagnostic::NoRoots];
     }
     let mut issues = Vec::new();
-    for root in roots {
-        if !root.is_dir() {
-            issues.push(Diagnostic::WorkspaceMissing(root));
-        }
+    let Ok((_, missing)) = crate::root_tracking::resolve(&config, &roots) else {
+        return vec![Diagnostic::ConfigUnreadable];
+    };
+    for root in missing {
+        issues.push(Diagnostic::WorkspaceMissing(root));
     }
     #[cfg(target_os = "macos")]
     if let Some(home) = env::var_os("HOME") {

@@ -4,6 +4,15 @@ Notable changes to the `rai` CLI are recorded here.
 
 ## Unreleased
 
+### Added
+
+- `rai uninstall` to remove the per-user watcher and Git template.
+- Renamed the `rai setup` command to `rai install`.
+- Watcher and `rai doctor` can recover a moved workspace by matching its saved
+  filesystem identity near the previous location or in the user's home directory.
+  For each unresolved workspace, interactive `rai doctor` asks whether to use a
+  new location, stop watching it, or keep it for later.
+
 ## 0.3.1 - 2026-09-30
 
 ### Added

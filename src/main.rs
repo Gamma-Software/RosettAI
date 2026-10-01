@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -10,7 +10,9 @@ mod claude;
 mod codex;
 mod copilot;
 mod perf;
+mod root_tracking;
 mod setup;
+mod uninstall;
 mod update;
 
 const CODEX: &str = "AGENTS.md";
@@ -37,7 +39,9 @@ struct Change {
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let is_update = args.first().is_some_and(|arg| arg == "update");
+    let is_update = args
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "update" | "uninstall"));
     let snapshot = args
         .iter()
         .any(|arg| arg == "--perf")
@@ -84,8 +88,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if json && !matches!(command.as_str(), "sync" | "status" | "doctor") {
         return Err("--json is only valid with sync, status, or doctor".into());
     }
-    if !roots.is_empty() && command != "setup" {
-        return Err("--root is only valid with setup".into());
+    if !roots.is_empty() && command != "install" {
+        return Err("--root is only valid with install".into());
     }
     if codex_hook && command != "sync" {
         return Err("--codex-hook is only valid with sync".into());
@@ -93,11 +97,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if codex_hook && (dry_run || json) {
         return Err("--codex-hook cannot be combined with --dry-run or --json".into());
     }
-    if repo.is_some() && command == "setup" {
-        return Err("--repo is not valid with setup".into());
+    if repo.is_some() && matches!(command.as_str(), "install" | "uninstall") {
+        return Err("--repo is not valid with install or uninstall".into());
     }
-    if command == "setup" {
+    if command == "install" {
         return setup::setup(roots);
+    }
+    if command == "uninstall" {
+        return uninstall::uninstall();
     }
     if command == "update" {
         if repo.is_some() || codex_hook || json {
@@ -141,7 +148,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: rai <setup|init|status|sync|doctor|update> [--repo PATH] [--root PATH] [--dry-run] [--json] [--codex-hook] [--perf]"
+    "usage: rai <install|uninstall|init|status|sync|doctor|update> [--repo PATH] [--root PATH] [--dry-run] [--json] [--codex-hook] [--perf]"
         .into()
 }
 
@@ -590,6 +597,7 @@ enum DoctorFix {
     Sync,
     SetupNew(PathBuf),
     SetupExisting,
+    WorkspaceMissing(PathBuf),
 }
 
 struct DoctorIssue {
@@ -645,31 +653,31 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
         let (message, solution, fix) = match issue {
             setup::Diagnostic::ConfigUnavailable => (
                 "cannot locate per-user setup configuration".into(),
-                "Set the user configuration directory (HOME or XDG_CONFIG_HOME on Unix, APPDATA on Windows), then run rai setup --root PATH.".into(),
+                "Set the user configuration directory (HOME or XDG_CONFIG_HOME on Unix, APPDATA on Windows), then run rai install --root PATH.".into(),
                 None,
             ),
             setup::Diagnostic::ConfigUnreadable => (
                 "cannot read configured workspace roots".into(),
-                "Inspect the per-user rai/roots.txt file and repair its permissions or contents before rerunning setup.".into(),
+                "Inspect the per-user rai/roots.txt and root-identities.json files and repair their permissions or contents before rerunning rai install.".into(),
                 None,
             ),
             setup::Diagnostic::NoRoots => {
                 let workspace = root.to_path_buf();
-                let command = format!("rai setup --root {}", setup::shell_quote(&workspace.to_string_lossy()));
+                let command = format!("rai install --root {}", setup::shell_quote(&workspace.to_string_lossy()));
                 (
-                    "rai setup has not configured any workspace roots".into(),
+                    "rai install has not configured any workspace roots".into(),
                     if can_setup { format!("Run {command} to watch this repository and install available integrations.") } else { format!("Install rai with cargo install --path ., then run {command}.") },
                     can_setup.then_some(DoctorFix::SetupNew(workspace)),
                 )
             }
             setup::Diagnostic::WorkspaceMissing(path) => (
                 format!("configured workspace is missing: {}", path.display()),
-                "Restore that directory or remove its stale entry from the per-user rai/roots.txt file.".into(),
-                None,
+                "Choose a new location, stop watching it, or keep it for later.".into(),
+                Some(DoctorFix::WorkspaceMissing(path)),
             ),
             setup::Diagnostic::WatcherMissing => (
                 "watcher service is not installed".into(),
-                if can_setup { "Rerun rai setup with the existing workspace roots to reinstall the watcher.".into() } else { "Install rai with cargo install --path ., then rerun rai setup with the existing workspace roots.".into() },
+                if can_setup { "Rerun rai install with the existing workspace roots to reinstall the watcher.".into() } else { "Install rai with cargo install --path ., then rerun rai install with the existing workspace roots.".into() },
                 can_setup.then_some(DoctorFix::SetupExisting),
             ),
         };
@@ -704,6 +712,7 @@ fn solution_for_plan_error(error: &str) -> String {
 fn doctor(root: &Path, json: bool) -> Result<(), String> {
     let mut fix_all = false;
     let mut passes = 0;
+    let mut deferred = HashSet::new();
     loop {
         let (issues, changes) = inspect_doctor(root);
         if json {
@@ -716,7 +725,10 @@ fn doctor(root: &Path, json: bool) -> Result<(), String> {
                     "{{\"message\":{},\"solution\":{},\"autoFixable\":{}}}",
                     json_string(&issue.message),
                     json_string(&issue.solution),
-                    issue.fix.is_some()
+                    issue
+                        .fix
+                        .as_ref()
+                        .is_some_and(|fix| !matches!(fix, DoctorFix::WorkspaceMissing(_)))
                 );
             }
             print!("],\"changes\":");
@@ -732,16 +744,56 @@ fn doctor(root: &Path, json: bool) -> Result<(), String> {
             println!("No issues found");
             return Ok(());
         }
+        if io::stdin().is_terminal() {
+            let pending = issues
+                .iter()
+                .filter_map(|issue| match &issue.fix {
+                    Some(DoctorFix::WorkspaceMissing(path)) if !deferred.contains(path) => {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let mut changed = false;
+            for path in pending {
+                match prompt_missing_workspace(&path)? {
+                    MissingChoice::Replace(new_path) => {
+                        setup::change_workspace(&path, Some(&new_path))?;
+                        changed = true;
+                    }
+                    MissingChoice::Remove => {
+                        setup::change_workspace(&path, None)?;
+                        changed = true;
+                    }
+                    MissingChoice::Keep => {
+                        deferred.insert(path);
+                    }
+                }
+            }
+            if changed {
+                println!("Rechecking...");
+                continue;
+            }
+        }
         for (index, issue) in issues.iter().enumerate() {
             println!("{}. {}", index + 1, issue.message);
             println!("   Solution: {}", issue.solution);
-            if issue.fix.is_some() {
+            if issue
+                .fix
+                .as_ref()
+                .is_some_and(|fix| !matches!(fix, DoctorFix::WorkspaceMissing(_)))
+            {
                 println!("   Automatic fix available");
             }
         }
         let available: Vec<DoctorFix> = issues
             .iter()
-            .filter_map(|issue| issue.fix.clone())
+            .filter_map(|issue| {
+                issue
+                    .fix
+                    .clone()
+                    .filter(|fix| !matches!(fix, DoctorFix::WorkspaceMissing(_)))
+            })
             .collect();
         if available.is_empty() {
             return Err(format!("{} issue(s) found", issues.len()));
@@ -799,12 +851,53 @@ enum FixChoice {
     Invalid,
 }
 
+enum MissingChoice {
+    Replace(PathBuf),
+    Remove,
+    Keep,
+}
+
+fn prompt_missing_workspace(path: &Path) -> Result<MissingChoice, String> {
+    loop {
+        println!("Configured workspace not found: {}", path.display());
+        print!("Choose [1] new location, [2] stop watching, [3] keep for later: ");
+        io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|e| e.to_string())?;
+        match answer.trim() {
+            "1" => {
+                print!("New workspace path: ");
+                io::stdout().flush().map_err(|e| e.to_string())?;
+                let mut input = String::new();
+                io::stdin()
+                    .read_line(&mut input)
+                    .map_err(|e| e.to_string())?;
+                let candidate = PathBuf::from(input.trim());
+                if candidate.is_dir() && !candidate.is_symlink() {
+                    return Ok(MissingChoice::Replace(candidate));
+                }
+                println!("That path is not a regular directory.");
+            }
+            "2" => return Ok(MissingChoice::Remove),
+            "3" | "" => return Ok(MissingChoice::Keep),
+            _ => println!("Enter 1, 2, or 3."),
+        }
+    }
+}
+
 fn choose_fixes(input: &str, issues: &[DoctorIssue]) -> FixChoice {
     match input.trim().to_ascii_lowercase().as_str() {
         "all" | "a" => FixChoice::Apply {
             fixes: issues
                 .iter()
-                .filter_map(|issue| issue.fix.clone())
+                .filter_map(|issue| {
+                    issue
+                        .fix
+                        .clone()
+                        .filter(|fix| !matches!(fix, DoctorFix::WorkspaceMissing(_)))
+                })
                 .collect(),
             all: true,
         },
@@ -815,6 +908,7 @@ fn choose_fixes(input: &str, issues: &[DoctorIssue]) -> FixChoice {
             .and_then(|number| number.checked_sub(1))
         {
             Some(index) if index < issues.len() => match &issues[index].fix {
+                Some(DoctorFix::WorkspaceMissing(_)) => FixChoice::Manual(index),
                 Some(fix) => FixChoice::Apply {
                     fixes: vec![fix.clone()],
                     all: false,
@@ -832,6 +926,9 @@ fn apply_doctor_fix(root: &Path, fix: DoctorFix) -> Result<(), String> {
         DoctorFix::Sync => sync(root, false),
         DoctorFix::SetupNew(workspace) => setup::setup(vec![workspace]),
         DoctorFix::SetupExisting => setup::repair_existing(),
+        DoctorFix::WorkspaceMissing(_) => {
+            Err("choose how to handle the missing workspace interactively".into())
+        }
     }
 }
 
