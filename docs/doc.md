@@ -4,7 +4,7 @@
 
 The current RosettAI implementation targets Codex, Claude Code, and GitHub Copilot Desktop.
 
-This document records the current design direction. A limited Rust CLI now implements `setup`, `init`, `status`, `sync`, and `doctor` for global and directory-scoped Markdown rules. Setup can install a polling watcher on macOS, Linux, and Windows, plus Git hooks for future clones; native-file migration and harness detection are not implemented. Where older architecture documents specify `.rosettai/` as the canonical directory or `rai run` as the primary activation path, this document supersedes those choices.
+This document records the current design direction. A limited Rust CLI now implements `install`, `uninstall`, `init`, `status`, `sync`, and `doctor` for global and directory-scoped Markdown rules. Setup can install a polling watcher on macOS, Linux, and Windows, plus Git hooks for future clones; native-file migration and harness detection are not implemented. Where older architecture documents specify `.rosettai/` as the canonical directory or `rai run` as the primary activation path, this document supersedes those choices.
 
 The proposed command interface is specified in [`cli.md`](cli.md).
 
@@ -12,16 +12,16 @@ The proposed command interface is specified in [`cli.md`](cli.md).
 
 The team writes and versions its rules, YAML subagents, Skills and MCP servers under `.agents/`. RosettAI reads that directory as the source of truth. The [Codex adapter](codex.md), [Claude Code adapter](claude.md), and [Copilot Desktop adapter](copilot-desktop.md) project them into each harness's native files. Other harness adapters remain future work.
 
-After a normal Git clone, a locally installed RosettAI watcher can discover repositories containing `.agents/`, synchronize their projections, and check again when the source changes. The CLI is named `rai` (short for RosettAI): `rai setup` installs the local synchronizer once, while `rai sync` and `rai status` are available on demand. Future harness detection must not imply that every source feature can be translated; unsupported behavior must be reported.
+After a normal Git clone, a locally installed RosettAI watcher can discover repositories containing `.agents/`, synchronize their projections, and check again when the source changes. The CLI is named `rai` (short for RosettAI): `rai install` installs the local synchronizer once, while `rai sync` and `rai status` are available on demand. Future harness detection must not imply that every source feature can be translated; unsupported behavior must be reported.
 
 ## Activation components
 
-- **CLI:** `rai setup` handles machine onboarding, `rai sync` performs an idempotent synchronization, `rai status` reports the effective state, and `rai doctor` diagnoses problems. The watcher and hooks are implementation details in the normal workflow.
+- **CLI:** `rai install` handles machine onboarding, `rai sync` performs an idempotent synchronization, `rai status` reports the effective state, and `rai doctor` diagnoses problems. The watcher and hooks are implementation details in the normal workflow.
 - **Local discovery and change detection:** A machine-level RosettAI component finds repositories containing `.agents/` after clone and detects edits made outside Git. It invokes the same synchronization logic as the CLI.
 - **Git hooks:** Where installed locally, `post-checkout` covers clone, branch switches, and worktree creation; `post-merge` covers successful merge-based pulls; `post-rewrite` covers rebases. Hooks call `rai sync` after the worktree changes. Git has no native `pre-fetch` or `pre-pull` hook, and fetch alone does not change the checked-out configuration.
 - **Skills:** Optional integration for agents to explain or operate RosettAI. Skills must not be required for initial synchronization or for keeping native configuration current.
 
-The Git hook integration must be installed on the developer's machine before cloning; hooks are not distributed by a repository. After a normal clone, `post-checkout` checks for `.agents/` and triggers synchronization so the detected harnesses receive their native files immediately. `git clone --no-checkout` does not trigger that hook. Hooks are an acceleration path, not the only trigger: the watcher also handles repositories cloned before installation, direct file edits, and Git workflows that do not run hooks. `rai setup` must preserve existing Git hooks and report when it cannot compose with their configuration.
+The Git hook integration must be installed on the developer's machine before cloning; hooks are not distributed by a repository. After a normal clone, `post-checkout` checks for `.agents/` and triggers synchronization so the detected harnesses receive their native files immediately. `git clone --no-checkout` does not trigger that hook. Hooks are an acceleration path, not the only trigger: the watcher also handles repositories cloned before installation, direct file edits, and Git workflows that do not run hooks. `rai install` must preserve existing Git hooks and report when it cannot compose with their configuration.
 
 ## Generated files and Git
 

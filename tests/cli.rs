@@ -332,7 +332,7 @@ fn setup_installs_isolated_hook_that_syncs_a_repo() {
     let config_global = sandbox.path().join("gitconfig");
     let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
     let result = Command::new(&rai)
-        .args(["setup", "--root"])
+        .args(["install", "--root"])
         .arg(&workspace)
         .arg("--perf")
         .env("HOME", sandbox.path())
@@ -429,4 +429,177 @@ fn setup_installs_isolated_hook_that_syncs_a_repo() {
             .unwrap()
             .contains("Clone rule.")
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_removes_service_and_template_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = tempfile::tempdir().unwrap();
+    let bin = sandbox.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let rai = bin.join("rai");
+    fs::copy(env!("CARGO_BIN_EXE_rai"), &rai).unwrap();
+    let systemctl = bin.join("systemctl");
+    fs::write(&systemctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let launchctl = bin.join("launchctl");
+    fs::write(&launchctl, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let repo = sandbox.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let global = sandbox.path().join("gitconfig");
+    let setup = Command::new(&rai)
+        .args(["install", "--root"])
+        .arg(&repo)
+        .env("HOME", sandbox.path())
+        .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        setup.status.success(),
+        "{}",
+        String::from_utf8_lossy(&setup.stderr)
+    );
+
+    let owned = "# rai-generated sha256:fixture\ngenerated\n";
+    fs::create_dir(repo.join(".codex")).unwrap();
+    fs::write(repo.join(".codex/config.toml"), owned).unwrap();
+    fs::write(
+        repo.join(".codex/custom.toml"),
+        "# rai-generated sha256:invalid\nmodified\n",
+    )
+    .unwrap();
+    fs::write(repo.join(".gitignore"), "# RosettAI generated files\n/.codex/config.toml\n/.codex/custom.toml\n# End RosettAI generated files\n").unwrap();
+    let hook = repo.join(".git/hooks/post-checkout");
+    fs::write(&hook, "#!/bin/sh\n# rai-managed-hook\nexit 0\n").unwrap();
+
+    let output = Command::new(&rai)
+        .arg("uninstall")
+        .current_dir(&repo)
+        .env("HOME", sandbox.path())
+        .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !sandbox
+            .path()
+            .join("config/systemd/user/rai-watch.service")
+            .exists()
+    );
+    assert!(
+        !sandbox
+            .path()
+            .join("Library/LaunchAgents/ai.rosettai.rai.plist")
+            .exists()
+    );
+    assert!(!sandbox.path().join("config/rai/git-template").exists());
+    assert!(sandbox.path().join("config/rai/roots.txt").exists());
+    assert!(hook.exists());
+    assert_eq!(
+        fs::read_to_string(repo.join(".codex/config.toml")).unwrap(),
+        owned
+    );
+    assert!(repo.join(".codex/custom.toml").exists());
+    let ignore = fs::read_to_string(repo.join(".gitignore")).unwrap();
+    assert!(ignore.contains("/.codex/custom.toml"));
+    assert!(ignore.contains("/.codex/config.toml"));
+    let configured = Command::new("git")
+        .args(["config", "--global", "--get", "init.templateDir"])
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .output()
+        .unwrap();
+    assert!(!configured.status.success());
+    let again = Command::new(&rai)
+        .arg("uninstall")
+        .current_dir(&repo)
+        .env("HOME", sandbox.path())
+        .env("XDG_CONFIG_HOME", sandbox.path().join("config"))
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(again.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_recovers_moved_workspace_and_warns_when_it_disappears() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let rai = bin.join("rai");
+    fs::copy(env!("CARGO_BIN_EXE_rai"), &rai).unwrap();
+    for command in ["launchctl", "systemctl"] {
+        let path = bin.join(command);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let old = dir.path().join("workspace");
+    let moved = dir.path().join("workspace-moved");
+    fs::create_dir(&old).unwrap();
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(repo.join(".agents/rules")).unwrap();
+    fs::write(repo.join(".agents/rules/general.md"), "Rule\n").unwrap();
+    let global = dir.path().join("gitconfig");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let run = |args: &[&str]| {
+        Command::new(&rai)
+            .args(args)
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("PATH", &path)
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .output()
+            .unwrap()
+    };
+    let install = run(&["install", "--root", old.to_str().unwrap()]);
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    fs::rename(&old, &moved).unwrap();
+    let doctor = run(&["doctor", "--json", "--repo", repo.to_str().unwrap()]);
+    assert!(!String::from_utf8_lossy(&doctor.stdout).contains("configured workspace is missing"));
+    let roots = fs::read_to_string(dir.path().join("config/rai/roots.txt")).unwrap();
+    assert!(roots.contains(&moved.to_string_lossy().to_string()));
+    fs::remove_dir(&moved).unwrap();
+    let doctor = run(&["doctor", "--json", "--repo", repo.to_str().unwrap()]);
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("configured workspace is missing"));
+    let json: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    let missing = json["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|issue| {
+            issue["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("configured workspace is missing")
+        })
+        .unwrap();
+    assert_eq!(missing["autoFixable"], false);
 }
