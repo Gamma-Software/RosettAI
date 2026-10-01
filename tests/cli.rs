@@ -352,6 +352,19 @@ fn setup_installs_isolated_hook_that_syncs_a_repo() {
         .path()
         .join("config/rai/git-template/hooks/post-checkout");
     assert!(hook.exists());
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(sandbox.path().join("config/rai/installed-hooks.json")).unwrap(),
+    )
+    .unwrap();
+    for event in ["post-checkout", "post-merge", "post-rewrite"] {
+        assert!(
+            registry
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["event"] == event)
+        );
+    }
     let saved = fs::read_to_string(sandbox.path().join("config/rai/roots.txt")).unwrap();
     assert!(saved.contains(&workspace.to_string_lossy().to_string()));
     #[cfg(target_os = "linux")]
@@ -428,6 +441,92 @@ fn setup_installs_isolated_hook_that_syncs_a_repo() {
         fs::read_to_string(clone.join("AGENTS.md"))
             .unwrap()
             .contains("Clone rule.")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn install_migrates_legacy_unix_configuration() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = tempfile::tempdir().unwrap();
+    let bin = sandbox.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let rai = bin.join("rai");
+    fs::copy(env!("CARGO_BIN_EXE_rai"), &rai).unwrap();
+    for name in ["systemctl", "launchctl"] {
+        let command = bin.join(name);
+        fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let workspace = sandbox.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    let previous = sandbox.path().join(".config/rai");
+    let hooks = previous.join("git-template/hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    fs::write(
+        previous.join("roots.txt"),
+        format!("{}\n", workspace.display()),
+    )
+    .unwrap();
+    let old_hook = hooks.join("post-checkout");
+    fs::write(&old_hook, "#!/bin/sh\n# rai-managed-hook\nexit 0\n").unwrap();
+    fs::write(
+        previous.join("installed-hooks.json"),
+        serde_json::to_vec(&serde_json::json!([
+            {"kind":"git-template","event":"post-checkout","path":old_hook}
+        ]))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::create_dir_all(sandbox.path().join(".rai/cache")).unwrap();
+    let global = sandbox.path().join("gitconfig");
+    assert!(
+        Command::new("git")
+            .args(["config", "--global", "init.templateDir"])
+            .arg(previous.join("git-template"))
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let result = Command::new(&rai)
+        .args(["install", "--root"])
+        .arg(&workspace)
+        .env("HOME", sandbox.path())
+        .env_remove("XDG_CONFIG_HOME")
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("PATH", path)
+        .env("XDG_CACHE_HOME", sandbox.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!previous.exists());
+    let current = sandbox.path().join(".rai");
+    assert!(current.join("cache").exists());
+    assert!(current.join("roots.txt").exists());
+    let registry: serde_json::Value =
+        serde_json::from_slice(&fs::read(current.join("installed-hooks.json")).unwrap()).unwrap();
+    assert_eq!(registry.as_array().unwrap().len(), 3);
+    assert!(registry.as_array().unwrap().iter().all(|entry| {
+        entry["path"]
+            .as_str()
+            .unwrap()
+            .starts_with(&current.to_string_lossy().to_string())
+    }));
+    let configured = Command::new("git")
+        .args(["config", "--global", "--get", "init.templateDir"])
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&configured.stdout).trim(),
+        current.join("git-template").to_string_lossy()
     );
 }
 
@@ -513,6 +612,11 @@ fn uninstall_removes_service_and_template_only() {
             .exists()
     );
     assert!(!sandbox.path().join("config/rai/git-template").exists());
+    let registry: serde_json::Value = serde_json::from_slice(
+        &fs::read(sandbox.path().join("config/rai/installed-hooks.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(registry.as_array().unwrap().is_empty());
     assert!(sandbox.path().join("config/rai/roots.txt").exists());
     assert!(hook.exists());
     assert_eq!(
