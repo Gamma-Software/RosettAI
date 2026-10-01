@@ -13,21 +13,7 @@ pub fn uninstall() -> Result<(), String> {
 }
 
 fn config_dir() -> Result<PathBuf, String> {
-    #[cfg(windows)]
-    {
-        return Ok(PathBuf::from(env::var_os("APPDATA").ok_or("APPDATA is not set")?).join("rai"));
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(PathBuf::from(
-            env::var_os("XDG_CONFIG_HOME")
-                .or_else(|| {
-                    env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").into_os_string())
-                })
-                .ok_or("HOME is not set")?,
-        )
-        .join("rai"))
-    }
+    crate::user_data::config_dir()
 }
 
 fn owned_file(path: &Path, marker: &str) -> Result<bool, String> {
@@ -50,11 +36,13 @@ fn remove_hook(path: &Path) -> Result<(), String> {
         return Ok(());
     }
     if !path.exists() {
+        crate::hook_registry::forget(path)?;
         return Ok(());
     }
     let body = fs::read_to_string(path).map_err(|e| e.to_string())?;
     if body.starts_with("#!/bin/sh\n# rai-managed-hook\n") {
         fs::remove_file(path).map_err(|e| e.to_string())?;
+        crate::hook_registry::forget(path)?;
     } else {
         eprintln!("rai: preserved unowned hook {}", path.display());
     }

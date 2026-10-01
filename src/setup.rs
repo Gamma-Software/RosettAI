@@ -178,19 +178,7 @@ fn discover(root: &Path, depth: usize) -> Vec<PathBuf> {
 }
 
 fn config_dir() -> Result<PathBuf, String> {
-    #[cfg(windows)]
-    {
-        let appdata = env::var_os("APPDATA").ok_or("APPDATA is not set")?;
-        return Ok(PathBuf::from(appdata).join("rai"));
-    }
-    #[cfg(not(windows))]
-    {
-        if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-            return Ok(PathBuf::from(xdg).join("rai"));
-        }
-        let home = env::var_os("HOME").ok_or("HOME is not set")?;
-        Ok(PathBuf::from(home).join(".config/rai"))
-    }
+    crate::user_data::config_dir()
 }
 
 fn read_roots(config: &Path) -> Result<Vec<PathBuf>, String> {
@@ -290,6 +278,9 @@ fn install_hook_template(config: &Path, executable: &Path) -> Result<(), String>
         .map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("could not configure Git template directory".into());
+    }
+    for name in ["post-checkout", "post-merge", "post-rewrite"] {
+        crate::hook_registry::remember_git_template(&hooks.join(name), name)?;
     }
     println!("Git hooks: installed for future clones");
     Ok(())

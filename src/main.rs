@@ -9,11 +9,13 @@ use std::process::{Command, ExitCode};
 mod claude;
 mod codex;
 mod copilot;
+mod hook_registry;
 mod perf;
 mod root_tracking;
 mod setup;
 mod uninstall;
 mod update;
+mod user_data;
 
 const CODEX: &str = "AGENTS.md";
 const LEGACY_CURSOR: &str = ".cursor/rules/rosettai.mdc";

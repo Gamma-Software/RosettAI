@@ -4,6 +4,15 @@ Notable changes to the `rai` CLI are recorded here.
 
 ## Unreleased
 
+### Changed
+
+- Store macOS and Linux per-user configuration under `~/.rai/` by default,
+  migrating existing `~/.config/rai/` data and Git template references.
+- Store the default Unix release-check cache under `~/.rai/cache/`.
+
+- Record installed Git template hooks in a per-user JSON file and update it on
+  uninstall.
+
 ### Added
 
 - `rai uninstall` to remove the per-user watcher and Git template.

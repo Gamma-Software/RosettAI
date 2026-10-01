@@ -64,11 +64,17 @@ fn fetch_latest(timeout: u8) -> Result<String, String> {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    let base = env::var_os("XDG_CACHE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("LOCALAPPDATA").map(PathBuf::from))
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(base.join("rai").join("latest-release"))
+    if let Some(xdg) = env::var_os("XDG_CACHE_HOME") {
+        return Some(PathBuf::from(xdg).join("rai/latest-release"));
+    }
+    #[cfg(windows)]
+    {
+        env::var_os("LOCALAPPDATA").map(|base| PathBuf::from(base).join("rai/latest-release"))
+    }
+    #[cfg(not(windows))]
+    {
+        env::var_os("HOME").map(|home| PathBuf::from(home).join(".rai/cache/latest-release"))
+    }
 }
 
 fn cached_latest() -> Option<String> {
