@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1-bookworm
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# The Rust tests only query the Codex version. Keep that check deterministic
+# while exercising projections for every supported adapter.
+RUN printf '#!/bin/sh\nif [ "$1" = "--version" ]; then\n  printf "codex-cli 0.158.0\\n"\nelse\n  exit 1\nfi\n' \
+      > /usr/local/bin/codex \
+    && chmod 755 /usr/local/bin/codex
+
+WORKDIR /workspace
+COPY . .
+RUN cargo test --locked --no-run \
+    --test claude_sync \
+    --test cli \
+    --test codex_sync \
+    --test copilot_sync \
+    --test sync_scenarios
+
+CMD ["cargo", "test", "--locked", "--test", "claude_sync", "--test", "cli", "--test", "codex_sync", "--test", "copilot_sync", "--test", "sync_scenarios"]

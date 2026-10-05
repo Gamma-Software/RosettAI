@@ -3,6 +3,609 @@ use std::io::Write;
 use std::process::Command;
 use std::process::Stdio;
 
+#[test]
+fn first_manual_sync_creates_empty_canonical_tree_but_git_hook_does_not() {
+    let repo = tempfile::tempdir().unwrap();
+    let invoke = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rai"))
+            .args(args)
+            .arg("--repo")
+            .arg(repo.path())
+            .env("XDG_CONFIG_HOME", repo.path().join("config"))
+            .output()
+            .unwrap()
+    };
+    assert!(invoke(&["sync", "--git-hook"]).status.success());
+    assert!(!repo.path().join(".agents").exists());
+    let sync = invoke(&["sync"]);
+    assert!(
+        sync.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    for directory in ["rules", "agents", "commands", "skills"] {
+        assert!(
+            repo.path()
+                .join(".agents")
+                .join(directory)
+                .join(".keep")
+                .exists()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(repo.path().join(".agents/mcp.yaml")).unwrap(),
+        "servers: {}\n"
+    );
+    assert!(!repo.path().join("AGENTS.md").exists());
+    assert!(!repo.path().join("CLAUDE.md").exists());
+    assert!(!repo.path().join(".github/copilot-instructions.md").exists());
+    assert!(!repo.path().join(".mcp.json").exists());
+    assert!(!repo.path().join(".vscode/mcp.json").exists());
+    assert!(invoke(&["sync", "--dry-run"]).status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn global_hook_syncs_a_fresh_clone_without_init() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = tempfile::tempdir().unwrap();
+    let bin = sandbox.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let rai = bin.join("rai");
+    fs::copy(env!("CARGO_BIN_EXE_rai"), &rai).unwrap();
+    for name in ["launchctl", "systemctl"] {
+        let command = bin.join(name);
+        fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(command, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let source = sandbox.path().join("source");
+    fs::create_dir_all(source.join(".agents/rules")).unwrap();
+    fs::write(source.join(".agents/rules/general.md"), "Clone rules.\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args(["add", ".agents"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&source)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let global = sandbox.path().join("gitconfig");
+    let config = sandbox.path().join("config");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let install = Command::new(&rai)
+        .args(["install", "--root"])
+        .arg(&source)
+        .env("HOME", sandbox.path())
+        .env("XDG_CONFIG_HOME", &config)
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let clone = sandbox.path().join("clone");
+    let result = Command::new("git")
+        .arg("clone")
+        .arg(&source)
+        .arg(&clone)
+        .env("HOME", sandbox.path())
+        .env("XDG_CONFIG_HOME", &config)
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        fs::read_to_string(clone.join("AGENTS.md"))
+            .unwrap()
+            .contains("Clone rules.")
+    );
+    let native_source = sandbox.path().join("native-source");
+    fs::create_dir(&native_source).unwrap();
+    fs::write(native_source.join("CLAUDE.md"), "Native clone guidance.\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&native_source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&native_source)
+            .args(["add", "CLAUDE.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&native_source)
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "initial"
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let native_clone = sandbox.path().join("native-clone");
+    let native_result = Command::new("git")
+        .arg("clone")
+        .arg(&native_source)
+        .arg(&native_clone)
+        .env("HOME", sandbox.path())
+        .env("XDG_CONFIG_HOME", &config)
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    assert!(
+        native_result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&native_result.stderr)
+    );
+    assert!(!native_clone.join(".agents").exists());
+    assert_eq!(
+        fs::read_to_string(native_clone.join("CLAUDE.md")).unwrap(),
+        "Native clone guidance.\n"
+    );
+    assert!(!String::from_utf8_lossy(&native_result.stderr).contains("Proceed with migration?"));
+    let marker = sandbox.path().join("local-hook-ran");
+    let local_hook = clone.join(".git/hooks/pre-commit");
+    fs::write(
+        &local_hook,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&local_hook, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(clone.join("note.txt"), "new file\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(&clone)
+            .args(["add", "note.txt"])
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let commit = Command::new("git")
+        .arg("-C")
+        .arg(&clone)
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "more",
+        ])
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .output()
+        .unwrap();
+    assert!(
+        commit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    assert!(marker.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn global_only_install_restores_previous_hook_path_on_uninstall() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let rai = sandbox.path().join("rai");
+    fs::copy(env!("CARGO_BIN_EXE_rai"), &rai).unwrap();
+    let previous = sandbox.path().join("existing-hooks");
+    fs::create_dir(&previous).unwrap();
+    let global = sandbox.path().join("gitconfig");
+    assert!(
+        Command::new("git")
+            .args(["config", "--global", "core.hooksPath"])
+            .arg(&previous)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let config = sandbox.path().join("config");
+    let invoke = |command: &str| {
+        Command::new(&rai)
+            .arg(command)
+            .env("HOME", sandbox.path())
+            .env("XDG_CONFIG_HOME", &config)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .output()
+            .unwrap()
+    };
+    let install = invoke("install");
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert!(!config.join("rai/roots.txt").exists());
+    assert!(config.join("rai/global-hooks/pre-commit").exists());
+    assert!(invoke("uninstall").status.success());
+    let configured = Command::new("git")
+        .args(["config", "--global", "--get", "core.hooksPath"])
+        .env("GIT_CONFIG_GLOBAL", &global)
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&configured.stdout).trim(),
+        previous.to_str().unwrap()
+    );
+    assert!(!config.join("rai/global-hooks").exists());
+}
+
+#[test]
+fn help_and_noninteractive_default_show_english_guidance() {
+    for args in [Vec::<&str>::new(), vec!["help"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("Run `rai` for the interactive helper"));
+        assert!(stdout.contains("Set up the current project if needed"));
+        assert!(stdout.contains("rai rollback"));
+    }
+}
+
+#[test]
+fn init_requires_migration_and_migrate_preserves_native_instructions() {
+    let repo = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "Keep existing rules.\n").unwrap();
+    fs::create_dir_all(repo.path().join(".github")).unwrap();
+    fs::write(
+        repo.path().join(".github/copilot-instructions.md"),
+        "Use the same review process.\n",
+    )
+    .unwrap();
+    let invoke = |command: &str, answer: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
+            .args([command, "--repo"])
+            .arg(repo.path())
+            .env("HOME", home.path())
+            .env("GIT_CONFIG_GLOBAL", home.path().join("gitconfig"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(answer.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let init = invoke("init", "n\n");
+    assert!(init.status.success());
+    assert!(String::from_utf8_lossy(&init.stdout).contains("Migration proposed"));
+    assert!(!repo.path().join(".agents").exists());
+    let migration = invoke("init", "y\n");
+    assert!(
+        migration.status.success(),
+        "{}",
+        String::from_utf8_lossy(&migration.stderr)
+    );
+    let rules = fs::read_to_string(repo.path().join(".agents/rules/migrated-harness.md")).unwrap();
+    assert!(rules.contains("Keep existing rules."));
+    assert!(rules.contains("Use the same review process."));
+    for directory in ["rules", "agents", "commands", "skills"] {
+        assert!(
+            repo.path()
+                .join(".agents")
+                .join(directory)
+                .join(".keep")
+                .exists()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(repo.path().join(".agents/mcp.yaml")).unwrap(),
+        "servers: {}\n"
+    );
+    let backups = fs::read_dir(
+        home.path()
+            .join(".rai/migrations")
+            .join(repo.path().file_name().unwrap()),
+    )
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap();
+    assert_eq!(backups.len(), 1);
+    let backup = backups[0].path();
+    assert_eq!(
+        fs::read_to_string(backup.join("AGENTS.md")).unwrap(),
+        "Keep existing rules.\n"
+    );
+    assert!(!repo.path().join(".agents/migration-backup").exists());
+    assert!(!repo.path().join("AGENTS.md").exists());
+    let manifest = fs::read_to_string(backup.join("manifest.json")).unwrap();
+    assert!(manifest.contains("AGENTS.md"));
+    let rollback = invoke("rollback", "");
+    assert!(
+        rollback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("AGENTS.md")).unwrap(),
+        "Keep existing rules.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join(".github/copilot-instructions.md")).unwrap(),
+        "Use the same review process.\n"
+    );
+    assert!(
+        !repo
+            .path()
+            .join(".agents/rules/migrated-harness.md")
+            .exists()
+    );
+}
+
+#[test]
+fn migrate_stops_before_writing_when_native_features_need_manual_conversion() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "Rules\n").unwrap();
+    fs::create_dir_all(repo.path().join(".codex")).unwrap();
+    fs::write(repo.path().join(".codex/config.toml"), "[mcp_servers]\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["migrate", "--repo"])
+        .arg(repo.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains(".codex/config.toml"));
+    assert!(repo.path().join("AGENTS.md").exists());
+    assert!(!repo.path().join(".agents").exists());
+}
+
+#[test]
+fn rollback_refuses_to_replace_edited_migrated_rules() {
+    let repo = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "Original rules.\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["init", "--repo"])
+        .arg(repo.path())
+        .env("HOME", home.path())
+        .env("GIT_CONFIG_GLOBAL", home.path().join("gitconfig"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    let rules = repo.path().join(".agents/rules/migrated-harness.md");
+    fs::write(&rules, "Edited after migration.\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["rollback", "--repo"])
+        .arg(repo.path())
+        .env("HOME", home.path())
+        .env("GIT_CONFIG_GLOBAL", home.path().join("gitconfig"))
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("migrated rules changed"));
+    assert!(!repo.path().join("AGENTS.md").exists());
+    assert_eq!(
+        fs::read_to_string(&rules).unwrap(),
+        "Edited after migration.\n"
+    );
+}
+
+#[test]
+fn rollback_restores_native_file_after_sync() {
+    let repo = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    fs::write(repo.path().join("AGENTS.md"), "Original rules.\n").unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["init", "--repo"])
+        .arg(repo.path())
+        .env("HOME", home.path())
+        .env("GIT_CONFIG_GLOBAL", home.path().join("gitconfig"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    assert!(child.wait_with_output().unwrap().status.success());
+    let sync = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["sync", "--repo"])
+        .arg(repo.path())
+        .env("HOME", home.path())
+        .env("GIT_CONFIG_GLOBAL", home.path().join("gitconfig"))
+        .output()
+        .unwrap();
+    assert!(
+        sync.status.success(),
+        "{}",
+        String::from_utf8_lossy(&sync.stderr)
+    );
+    let rollback = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["rollback", "--repo"])
+        .arg(repo.path())
+        .env("HOME", home.path())
+        .env("GIT_CONFIG_GLOBAL", home.path().join("gitconfig"))
+        .output()
+        .unwrap();
+    assert!(
+        rollback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("AGENTS.md")).unwrap(),
+        "Original rules.\n"
+    );
+}
+
+#[test]
+fn setup_requires_migration_before_registering_a_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let installed = temp.path().join("rai");
+    fs::copy(env!("CARGO_BIN_EXE_rai"), &installed).unwrap();
+    let workspace = temp.path().join("workspace");
+    let repo = workspace.join("project");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::write(repo.join("AGENTS.md"), "Existing project rules.\n").unwrap();
+    let config = temp.path().join("config");
+    let output = Command::new(installed)
+        .args(["install", "--root"])
+        .arg(&workspace)
+        .env("XDG_CONFIG_HOME", &config)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("run `rai migrate"));
+    assert!(!config.join("rai/roots.txt").exists());
+}
+
+#[test]
+fn migrate_keeps_git_tracked_native_file_untouched() {
+    let repo = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .arg("init")
+            .arg(repo.path())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    fs::write(repo.path().join("AGENTS.md"), "Tracked project rules.\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["-C"])
+            .arg(repo.path())
+            .args(["add", "AGENTS.md"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["migrate", "--repo"])
+        .arg(repo.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Migration proposed"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Migration cancelled"));
+    assert_eq!(
+        fs::read_to_string(repo.path().join("AGENTS.md")).unwrap(),
+        "Tracked project rules.\n"
+    );
+    assert!(!repo.path().join(".agents").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn first_init_sets_up_machine_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    fs::create_dir(&bin).unwrap();
+    let installed = bin.join("rai");
+    fs::copy(env!("CARGO_BIN_EXE_rai"), &installed).unwrap();
+    for name in ["launchctl", "systemctl"] {
+        let command = bin.join(name);
+        fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(command, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let repo = temp.path().join("project");
+    fs::create_dir(&repo).unwrap();
+    let config = temp.path().join("config");
+    let invoke = |command: &str| {
+        Command::new(&installed)
+            .args([command, "--repo"])
+            .arg(&repo)
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", &config)
+            .env("GIT_CONFIG_GLOBAL", temp.path().join("gitconfig"))
+            .env("PATH", &path)
+            .output()
+            .unwrap()
+    };
+    let first = invoke("init");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(repo.join(".agents/rules/.keep").exists());
+    assert!(repo.join(".agents/agents/.keep").exists());
+    assert!(repo.join(".agents/skills/.keep").exists());
+    assert_eq!(
+        fs::read_to_string(repo.join(".agents/mcp.yaml")).unwrap(),
+        "servers: {}\n"
+    );
+    assert!(!repo.join(".agents/rules/general.md").exists());
+    assert_eq!(
+        fs::read_to_string(config.join("rai/roots.txt"))
+            .unwrap()
+            .trim(),
+        repo.canonicalize().unwrap().to_str().unwrap()
+    );
+    let second = invoke("init");
+    assert!(!second.status.success());
+    assert!(!String::from_utf8_lossy(&second.stdout).contains("Configuring rai"));
+}
+
 #[cfg(unix)]
 #[test]
 fn update_installs_verified_release_archive() {
@@ -252,7 +855,14 @@ fn init_status_and_doctor_commands() {
 
     let initialized = invoke(&["init"]);
     assert!(initialized.status.success());
-    assert!(repo.path().join(".agents/rules/general.md").exists());
+    assert!(repo.path().join(".agents/rules/.keep").exists());
+    assert!(repo.path().join(".agents/agents/.keep").exists());
+    assert!(repo.path().join(".agents/skills/.keep").exists());
+    assert_eq!(
+        fs::read_to_string(repo.path().join(".agents/mcp.yaml")).unwrap(),
+        "servers: {}\n"
+    );
+    assert!(!repo.path().join(".agents/rules/general.md").exists());
     assert!(!invoke(&["init"]).status.success());
 
     let before = invoke(&["status", "--json"]);
@@ -290,7 +900,7 @@ fn doctor_json_suggests_init_for_unconfigured_repo() {
         .output()
         .unwrap();
     let output = String::from_utf8_lossy(&plain.stdout);
-    assert!(output.contains("Solution: Run rai init"));
+    assert!(output.contains("Solution: Run rai sync"));
     assert!(!output.contains("Fix which issue?"));
 }
 

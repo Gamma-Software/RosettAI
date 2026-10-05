@@ -36,8 +36,8 @@ fn ok(repo: &Path, args: &[&str]) -> Output {
     output
 }
 
-fn failed(repo: &Path, expected: &str) {
-    let output = run(repo, &["sync"]);
+fn failed(repo: &Path, args: &[&str], expected: &str) {
+    let output = run(repo, args);
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr).contains(expected),
@@ -59,8 +59,8 @@ fn projects_rules_agents_mcp_and_preserves_canonical_skills() {
     let repo = repo();
     fs::create_dir_all(repo.path().join(".agents/subagents")).unwrap();
     fs::write(
-        repo.path().join(".agents/subagents/reviewer.yaml"),
-        "name: reviewer\ndescription: Review changes.\nmodel: gpt-6-luna\nmodel_reasoning_effort: high\nsandbox_mode: read-only\nnickname_candidates: [Atlas]\ndeveloper_instructions: |\n  Find regressions.\n  Cite affected files.\n",
+        repo.path().join(".agents/subagents/reviewer.md"),
+        "---\nname: reviewer\ndescription: Review changes.\nmodel: gpt-6-luna\nmodel_reasoning_effort: high\nsandbox_mode: read-only\nnickname_candidates: [Atlas]\n---\n\nFind regressions.\nCite affected files.\n",
     )
     .unwrap();
     fs::create_dir_all(repo.path().join(".agents/skills/review")).unwrap();
@@ -70,8 +70,8 @@ fn projects_rules_agents_mcp_and_preserves_canonical_skills() {
     )
     .unwrap();
     fs::write(
-        repo.path().join(".agents/mcp.json"),
-        r#"{"servers":{"docs":{"transport":"http","url":"https://example.invalid/mcp","bearer_token_env_var":"DOCS_TOKEN"},"local":{"transport":"stdio","command":"npx","args":["-y","example"],"cwd":"tools","env_vars":["LOCAL_TOKEN"]}}}"#,
+        repo.path().join(".agents/mcp.yaml"),
+        "servers:\n  docs:\n    transport: http\n    url: https://example.invalid/mcp\n    bearer_token_env_var: DOCS_TOKEN\n  local:\n    transport: stdio\n    command: npx\n    args: [-y, example]\n    cwd: tools\n    env_vars: [LOCAL_TOKEN]\n",
     )
     .unwrap();
 
@@ -174,16 +174,16 @@ fn removing_canonical_resources_cleans_only_owned_copilot_outputs() {
     let scoped = repo.path().join(".agents/rules/frontend.md");
     fs::write(&scoped, "---\npath: frontend\n---\nFrontend only.\n").unwrap();
     fs::create_dir_all(repo.path().join(".agents/subagents")).unwrap();
-    let agent = repo.path().join(".agents/subagents/reviewer.yaml");
+    let agent = repo.path().join(".agents/subagents/reviewer.md");
     fs::write(
         &agent,
-        "name: reviewer\ndescription: Review.\ndeveloper_instructions: Review.\n",
+        "---\nname: reviewer\ndescription: Review.\n---\n\nReview.\n",
     )
     .unwrap();
-    let mcp = repo.path().join(".agents/mcp.json");
+    let mcp = repo.path().join(".agents/mcp.yaml");
     fs::write(
         &mcp,
-        r#"{"servers":{"docs":{"transport":"http","url":"https://example.invalid/mcp"}}}"#,
+        "servers:\n  docs:\n    transport: http\n    url: https://example.invalid/mcp\n",
     )
     .unwrap();
     ok(repo.path(), &["sync"]);
@@ -204,6 +204,16 @@ fn removing_canonical_resources_cleans_only_owned_copilot_outputs() {
     )
     .unwrap();
 
+    failed(
+        repo.path(),
+        &["sync", "--git-hook"],
+        "unmanaged native configuration",
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join(".github/agents/user.agent.md")).unwrap(),
+        "User-owned agent.\n"
+    );
+    fs::remove_file(repo.path().join(".github/agents/user.agent.md")).unwrap();
     ok(repo.path(), &["sync"]);
     for path in [
         ".github/copilot-instructions.md",
@@ -213,10 +223,6 @@ fn removing_canonical_resources_cleans_only_owned_copilot_outputs() {
     ] {
         assert!(!repo.path().join(path).exists(), "stale {path}");
     }
-    assert_eq!(
-        fs::read_to_string(repo.path().join(".github/agents/user.agent.md")).unwrap(),
-        "User-owned agent.\n"
-    );
     let ignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
     for path in [
         ".github/copilot-instructions.md",
@@ -239,15 +245,15 @@ fn copilot_collisions_abort_before_any_projection_is_written() {
         if path.contains("reviewer") {
             fs::create_dir_all(repo.path().join(".agents/subagents")).unwrap();
             fs::write(
-                repo.path().join(".agents/subagents/reviewer.yaml"),
-                "name: reviewer\ndescription: Review.\ndeveloper_instructions: Review.\n",
+                repo.path().join(".agents/subagents/reviewer.md"),
+                "---\nname: reviewer\ndescription: Review.\n---\n\nReview.\n",
             )
             .unwrap();
         }
         if path.ends_with("mcp.json") {
             fs::write(
-                repo.path().join(".agents/mcp.json"),
-                r#"{"servers":{"docs":{"transport":"http","url":"https://example.invalid/mcp"}}}"#,
+                repo.path().join(".agents/mcp.yaml"),
+                "servers:\n  docs:\n    transport: http\n    url: https://example.invalid/mcp\n",
             )
             .unwrap();
         }
@@ -255,7 +261,11 @@ fn copilot_collisions_abort_before_any_projection_is_written() {
         fs::create_dir_all(collision.parent().unwrap()).unwrap();
         fs::write(&collision, "User-owned content.\n").unwrap();
 
-        failed(repo.path(), "unowned or modified output conflict");
+        failed(
+            repo.path(),
+            &["sync", "--git-hook"],
+            "unmanaged native configuration",
+        );
         assert_eq!(
             fs::read_to_string(collision).unwrap(),
             "User-owned content.\n"
@@ -279,6 +289,10 @@ fn modified_copilot_projection_is_never_overwritten() {
     )
     .unwrap();
 
-    failed(repo.path(), "unowned or modified output conflict");
+    failed(
+        repo.path(),
+        &["sync", "--git-hook"],
+        "unmanaged native configuration",
+    );
     assert_eq!(fs::read_to_string(path).unwrap(), edited);
 }

@@ -43,17 +43,12 @@ pub fn outputs(root: &Path) -> Result<Vec<(String, String)>, String> {
     let mut config =
         String::from("# Codex projection from .agents/ (tested with codex-cli 0.152.1)\n");
     let subagents = read_subagents(root)?;
-    let mcp_path = root.join(".agents/mcp.json");
-    if mcp_path.exists() {
-        if mcp_path.is_symlink() {
-            return Err("symlink source unsupported: .agents/mcp.json".into());
-        }
-        let manifest = read_json(&mcp_path)?;
+    if let Some(manifest) = read_mcp(root)? {
         let top = manifest
             .as_object()
-            .ok_or(".agents/mcp.json must be an object")?;
+            .ok_or("MCP manifest must be an object")?;
         if top.len() != 1 || !top.contains_key("servers") {
-            return Err(".agents/mcp.json supports only servers".into());
+            return Err("MCP manifest supports only servers".into());
         }
         let servers = top["servers"]
             .as_object()
@@ -163,75 +158,130 @@ pub fn outputs(root: &Path) -> Result<Vec<(String, String)>, String> {
 
 pub fn read_subagents(root: &Path) -> Result<Vec<Value>, String> {
     let mut subagents = Vec::new();
-    let agents_dir = root.join(".agents/subagents");
-    if agents_dir.exists() {
-        if agents_dir.is_symlink() {
-            return Err("symlink source unsupported: .agents/subagents".into());
-        }
-        let mut entries = fs::read_dir(&agents_dir)
-            .map_err(|e| e.to_string())?
-            .map(|entry| entry.map(|e| e.path()).map_err(|e| e.to_string()))
-            .collect::<Result<Vec<_>, _>>()?;
-        entries.sort();
-        for path in entries {
-            if path.is_symlink()
-                || !path.is_file()
-                || path.extension().is_none_or(|ext| ext != "yaml")
-            {
+    for directory in ["agents", "subagents"] {
+        let agents_dir = root.join(".agents").join(directory);
+        if agents_dir.exists() {
+            if agents_dir.is_symlink() {
                 return Err(format!(
-                    "only regular .yaml subagents are supported: {}",
-                    path.display()
+                    "symlink source unsupported: {}",
+                    agents_dir.display()
                 ));
             }
-            let name = path.file_stem().unwrap().to_string_lossy();
-            valid_name(&name)?;
-            let source =
-                fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let value: Value =
-                serde_yaml::from_str(&source).map_err(|e| format!("{}: {e}", path.display()))?;
-            let fields = value.as_object().ok_or("subagent must be an object")?;
-            for key in fields.keys() {
-                if ![
-                    "name",
-                    "description",
-                    "developer_instructions",
-                    "model",
-                    "model_reasoning_effort",
-                    "sandbox_mode",
-                    "nickname_candidates",
-                ]
-                .contains(&key.as_str())
+            let mut entries = fs::read_dir(&agents_dir)
+                .map_err(|e| e.to_string())?
+                .map(|entry| entry.map(|e| e.path()).map_err(|e| e.to_string()))
+                .collect::<Result<Vec<_>, _>>()?;
+            entries.sort();
+            for path in entries {
+                if path.file_name().is_some_and(|name| name == ".keep")
+                    && path.is_file()
+                    && !path.is_symlink()
                 {
-                    return Err(format!("unsupported subagent field {name}.{key}"));
+                    continue;
                 }
-            }
-            let field = |field| {
-                fields
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .ok_or(format!("subagent {name} needs string {field}"))
-            };
-            if fields["name"].as_str() != Some(name.as_ref()) {
-                return Err(format!("subagent name must match filename: {name}"));
-            }
-            field("description")?;
-            field("developer_instructions")?;
-            for optional in ["model", "model_reasoning_effort", "sandbox_mode"] {
-                if fields.contains_key(optional) {
-                    field(optional)?;
-                }
-            }
-            if let Some(value) = fields.get("nickname_candidates") {
-                let candidates = value.as_array().ok_or(format!(
-                    "subagent {name} nickname_candidates must be an array"
-                ))?;
-                if candidates.is_empty() || candidates.iter().any(|value| !value.is_string()) {
+                if path.is_symlink()
+                    || !path.is_file()
+                    || path
+                        .extension()
+                        .is_none_or(|ext| ext != "yaml" && ext != "md")
+                {
                     return Err(format!(
-                        "subagent {name} nickname_candidates must contain strings"
+                        "only regular .md or .yaml subagents are supported: {}",
+                        path.display()
                     ));
                 }
+                let name = path.file_stem().unwrap().to_string_lossy();
+                valid_name(&name)?;
+                if subagents
+                    .iter()
+                    .any(|agent: &Value| agent["name"].as_str() == Some(name.as_ref()))
+                {
+                    return Err(format!("duplicate subagent name: {name}"));
+                }
+                let source =
+                    fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                let mut value: Value = if path.extension().is_some_and(|ext| ext == "md") {
+                    let (header, body) = source
+                        .strip_prefix("---\n")
+                        .and_then(|rest| rest.split_once("\n---\n"))
+                        .ok_or(format!("invalid subagent frontmatter: {}", path.display()))?;
+                    let mut value: Value = serde_yaml::from_str(header)
+                        .map_err(|e| format!("{}: {e}", path.display()))?;
+                    let fields = value
+                        .as_object_mut()
+                        .ok_or("subagent frontmatter must be an object")?;
+                    if fields.contains_key("developer_instructions") {
+                        return Err(format!(
+                            "subagent {name} instructions belong in the Markdown body"
+                        ));
+                    }
+                    let instructions = body.trim();
+                    if instructions.is_empty() {
+                        return Err(format!("subagent {name} needs a Markdown body"));
+                    }
+                    fields.insert(
+                        "developer_instructions".into(),
+                        Value::String(format!("{instructions}\n")),
+                    );
+                    value
+                } else {
+                    serde_yaml::from_str(&source).map_err(|e| format!("{}: {e}", path.display()))?
+                };
+                let fields = value.as_object_mut().ok_or("subagent must be an object")?;
+                match fields.remove("type") {
+                    Some(value) if value.as_str() == Some("agent") => {}
+                    Some(_) => {
+                        return Err(format!("{}: agent type must be `agent`", path.display()));
+                    }
+                    None if directory == "agents" => {
+                        return Err(format!("{}: agent needs type: agent", path.display()));
+                    }
+                    None => {}
+                }
+                let fields = value.as_object().ok_or("subagent must be an object")?;
+                for key in fields.keys() {
+                    if ![
+                        "name",
+                        "description",
+                        "developer_instructions",
+                        "model",
+                        "model_reasoning_effort",
+                        "sandbox_mode",
+                        "nickname_candidates",
+                    ]
+                    .contains(&key.as_str())
+                    {
+                        return Err(format!("unsupported subagent field {name}.{key}"));
+                    }
+                }
+                let field = |field| {
+                    fields
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .ok_or(format!("subagent {name} needs string {field}"))
+                };
+                if fields["name"].as_str() != Some(name.as_ref()) {
+                    return Err(format!("subagent name must match filename: {name}"));
+                }
+                field("description")?;
+                field("developer_instructions")?;
+                for optional in ["model", "model_reasoning_effort", "sandbox_mode"] {
+                    if fields.contains_key(optional) {
+                        field(optional)?;
+                    }
+                }
+                if let Some(value) = fields.get("nickname_candidates") {
+                    let candidates = value.as_array().ok_or(format!(
+                        "subagent {name} nickname_candidates must be an array"
+                    ))?;
+                    if candidates.is_empty() || candidates.iter().any(|value| !value.is_string()) {
+                        return Err(format!(
+                            "subagent {name} nickname_candidates must contain strings"
+                        ));
+                    }
+                }
+                subagents.push(value);
             }
-            subagents.push(value);
         }
     }
     Ok(subagents)
@@ -247,6 +297,12 @@ pub fn validate_skills(root: &Path) -> Result<(), String> {
     }
     for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
         let path = entry.map_err(|e| e.to_string())?.path();
+        if path.file_name().is_some_and(|name| name == ".keep")
+            && path.is_file()
+            && !path.is_symlink()
+        {
+            continue;
+        }
         if path.is_symlink() || !path.is_dir() {
             return Err(format!(
                 "skill must be a regular directory: {}",
@@ -271,9 +327,38 @@ pub fn validate_skills(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn read_json(path: &Path) -> Result<Value, String> {
-    let source = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    serde_json::from_str(&source).map_err(|e| format!("{}: {e}", path.display()))
+pub fn read_mcp(root: &Path) -> Result<Option<Value>, String> {
+    let yaml = root.join(".agents/mcp.yaml");
+    let json = root.join(".agents/mcp.json");
+    if yaml.exists() && json.exists() {
+        return Err("both .agents/mcp.yaml and .agents/mcp.json exist".into());
+    }
+    let path = if yaml.exists() {
+        yaml
+    } else if json.exists() {
+        json
+    } else {
+        return Ok(None);
+    };
+    if path.is_symlink() {
+        return Err(format!("symlink source unsupported: {}", path.display()));
+    }
+    let source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let value: Value = if path.extension().is_some_and(|ext| ext == "yaml") {
+        serde_yaml::from_str(&source).map_err(|e| format!("{}: {e}", path.display()))?
+    } else {
+        serde_json::from_str(&source).map_err(|e| format!("{}: {e}", path.display()))?
+    };
+    if value.as_object().is_some_and(|top| {
+        top.len() == 1
+            && top
+                .get("servers")
+                .and_then(Value::as_object)
+                .is_some_and(|servers| servers.is_empty())
+    }) {
+        return Ok(None);
+    }
+    Ok(Some(value))
 }
 
 fn valid_name(value: &str) -> Result<(), String> {

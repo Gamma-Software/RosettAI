@@ -16,6 +16,8 @@ The project is in an early proof-of-concept phase. The Rust CLI implements `inst
 
 RosettAI's proposed model stores canonical resources in `.agents/`, validates them, and synchronizes local projections for supported installed harnesses. See the [current design](docs/doc.md) and [`rai` CLI contract](docs/cli.md). The [earlier architecture proposal](docs/architecture/README.md) remains available for background.
 
+The [canonical source format](docs/doc.md#canonical-source-formats) is Markdown with YAML frontmatter for instructions and YAML for data-only configuration. The CLI also reads legacy YAML subagents and JSON MCP declarations during migration.
+
 ## Install the prebuilt CLI
 
 On macOS, Linux, WSL, or Git Bash on Windows, run:
@@ -52,9 +54,9 @@ cargo run -- sync --repo /path/to/test-repo
 cargo test
 ```
 
-The command generates Codex `AGENTS.md`/TOML files, Claude Code `CLAUDE.md`/`.claude`/`.mcp.json` files, and Copilot Desktop `.github` instruction/agent files plus `.vscode/mcp.json`, then adds exact output paths to the repository-root `.gitignore`. Rules stay directly in `.agents/rules/`; subagents stay as YAML in `.agents/subagents/`. See the [Codex workflow](docs/codex.md), [Claude Code adapter](docs/claude.md), and [Copilot Desktop workflow](docs/copilot-desktop.md). It refuses to replace existing unowned, modified, or Git-tracked outputs.
+The command generates Codex `AGENTS.md`/TOML files, Claude Code `CLAUDE.md`/`.claude`/`.mcp.json` files, and Copilot Desktop `.github` instruction/agent files plus `.vscode/mcp.json`, then adds exact output paths to the repository-root `.gitignore`. Rules stay directly in `.agents/rules/`; subagents use Markdown with YAML frontmatter in `.agents/subagents/`, and MCP declarations use `.agents/mcp.yaml`. See the [Codex workflow](docs/codex.md), [Claude Code adapter](docs/claude.md), and [Copilot Desktop workflow](docs/copilot-desktop.md). It refuses to replace existing unowned, modified, or Git-tracked outputs.
 
-Run `cargo install --path .` to build and install `rai` from this checkout. Then `rai init` creates a starter `.agents/rules/general.md`, `rai status` previews drift, and `rai doctor` reports configuration problems. `rai install --root /path/to/workspace` registers a workspace for polling and installs a per-user watcher through launchd on macOS, systemd on Linux, or Task Scheduler on Windows. It also configures Git hooks for future clones when no global hook path or custom template directory is already configured. Setup is not run automatically by installation.
+Run `cargo install --path .` to build and install `rai` from this checkout. Then `rai sync` creates an empty `.agents/` source tree on first manual use and synchronizes it. `rai status` previews drift, and `rai doctor` reports configuration problems. `rai install` sets up global Git hooks once for existing repositories and future clones. `rai install --root /path/to/workspace` additionally registers a directory for polling and installs a per-user watcher through launchd on macOS, systemd on Linux, or Task Scheduler on Windows. Setup is not run automatically by installation.
 
 Every normal command warns at the end when a newer stable GitHub Release is available, using a one-hour cache. The check requires `curl` and a network connection.
 

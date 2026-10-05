@@ -8,20 +8,25 @@ Run `rai sync` in a repository containing Markdown rules under `.agents/rules/`.
 | --- | --- |
 | `.agents/rules/*.md` | Projected to root or directory-scoped `AGENTS.md` files. |
 | `.agents/skills/<name>/SKILL.md` | Used in place by Codex; validated, not copied. |
-| `.agents/mcp.json` | Converted to project `.codex/config.toml` MCP server entries. |
-| `.agents/subagents/<name>.yaml` | Converted to `.codex/agents/<name>.toml` and registered in `.codex/config.toml`. |
+| `.agents/mcp.yaml` | Converted to project `.codex/config.toml` MCP server entries. |
+| `.agents/subagents/<name>.md` | Converted to `.codex/agents/<name>.toml` and registered in `.codex/config.toml`. |
 | `rai sync --codex-hook` | Guards prompt submission when configured in the generated Codex project config. |
 
 All rule Markdown files live directly in `.agents/rules/`. Without frontmatter, a rule contributes to root `AGENTS.md`. To target another directory, set `path` in the file:
 
 ```md
 ---
+name: AGENTS.md
 path: frontend/components
 ---
 Follow the component conventions.
 ```
 
 For example, this content in `.agents/rules/components.md` produces `frontend/components/AGENTS.md`. The path is relative to the repository root; `path: .` explicitly targets the root. The target directory must already exist. Multiple rules targeting the same file are combined in deterministic filename order. Nested source directories and invalid or escaping paths are rejected. RosettAI removes stale scoped projections only when they are still rai-owned and untracked.
+
+`name` optionally records the original instruction filename. Accepted values are `AGENTS.md`, `CLAUDE.md`, and `copilot-instructions.md`; other explicit names fail validation before synchronization. Migration fills it with the original instruction filename, such as `AGENTS.md`, even when the canonical file is named `AGENTS-src.md`. Projections use it in the rule heading; older rules fall back to their filename. A rule declaring only `name` is global. Renaming a source file preserves its name and scope when the metadata stays the same. Unknown metadata fields, duplicate fields, and invalid names or paths are rejected before writing projections.
+
+The Codex adapter writes `AGENTS.md` in the directory selected by `path`. For example, `.agents/rules/repository.md` with `name: AGENTS.md` and `path: .` contributes to root `AGENTS.md`. The canonical filename identifies the source file, and `name` supplies its section heading in that projection.
 
 Codex applies an `AGENTS.md` according to its directory hierarchy and the session's working directory. Start a session in `frontend/` to load `frontend/AGENTS.md`; a session started at the repository root does not eagerly load every nested file.
 

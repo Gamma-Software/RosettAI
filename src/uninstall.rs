@@ -7,8 +7,50 @@ const HOOKS: [&str; 3] = ["post-checkout", "post-merge", "post-rewrite"];
 
 pub fn uninstall() -> Result<(), String> {
     remove_watcher()?;
+    remove_global_hooks()?;
     remove_template()?;
-    println!("RosettAI watcher and Git template removed.");
+    println!("RosettAI watcher and Git hooks removed.");
+    Ok(())
+}
+
+fn remove_global_hooks() -> Result<(), String> {
+    let config = config_dir()?;
+    let hooks = config.join("global-hooks");
+    let record = config.join("global-hooks-previous.json");
+    if hooks.is_symlink() || record.is_symlink() {
+        return Err("symlink global hook configuration conflict".into());
+    }
+    if !record.exists() {
+        return Ok(());
+    }
+    let previous: Option<String> =
+        serde_json::from_slice(&fs::read(&record).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("{}: {e}", record.display()))?;
+    let current = Command::new("git")
+        .args(["config", "--global", "--get", "core.hooksPath"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if current.status.success()
+        && String::from_utf8_lossy(&current.stdout).trim() == hooks.to_string_lossy()
+    {
+        let mut command = Command::new("git");
+        command.args(["config", "--global"]);
+        if let Some(old) = previous {
+            command.arg("core.hooksPath").arg(old);
+        } else {
+            command.args(["--unset", "core.hooksPath"]);
+        }
+        if !command.status().map_err(|e| e.to_string())?.success() {
+            return Err("could not restore global core.hooksPath".into());
+        }
+    }
+    for hook in crate::setup::GIT_HOOK_EVENTS {
+        remove_hook(&hooks.join(hook))?;
+    }
+    remove_empty_dir(&hooks)?;
+    if !hooks.exists() {
+        fs::remove_file(record).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

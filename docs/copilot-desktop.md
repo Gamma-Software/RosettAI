@@ -5,9 +5,9 @@
 | Canonical resource | Copilot Desktop projection |
 | --- | --- |
 | `.agents/rules/*.md` | Global rules become `.github/copilot-instructions.md`; scoped rules become `.github/instructions/*.instructions.md` with `applyTo`. |
-| `.agents/subagents/<name>.yaml` | `.github/agents/<name>.agent.md` with `target: vscode`; the Markdown body contains `developer_instructions`. |
+| `.agents/subagents/<name>.md` | `.github/agents/<name>.agent.md` with `target: vscode`; the Markdown body contains `developer_instructions`. |
 | `.agents/skills/<name>/SKILL.md` | Read directly in place by VS Code; validated, not copied. |
-| `.agents/mcp.json` | `.vscode/mcp.json`, including environment-variable references for credentials. |
+| `.agents/mcp.yaml` | `.vscode/mcp.json`, including environment-variable references for credentials. |
 
 Copilot model names and Codex model names are not interchangeable. RosettAI therefore leaves the model selected in VS Code and does not copy the Codex-specific `model`, `model_reasoning_effort`, `sandbox_mode`, or `nickname_candidates` fields into the Copilot agent. The portable role, description, and developer instructions are preserved.
 

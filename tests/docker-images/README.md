@@ -1,5 +1,35 @@
 # Tests Codex et GitHub Copilot dans Docker
 
+## Lancer les tests d'intégration dans Docker
+
+Depuis la racine du dépôt :
+
+```sh
+docker build -f tests/docker-images/Dockerfile.tests -t rosettai-tests:local .
+docker run --rm rosettai-tests:local
+```
+
+Cette image exécute uniquement les cinq suites d'intégration de `tests/`,
+avec leurs fixtures et clones Git. Elle ne lance pas les tests unitaires de
+`src/`. Elle fournit un substitut de `codex --version`
+pour que les projections de tous les adaptateurs soient testées sans installer
+les applications ni utiliser de compte. Le code source est copié à la
+construction : reconstruisez l'image après une modification. Les branches de
+tests propres à macOS et Windows ne s'exécutent pas dans ce conteneur Linux.
+
+## Lancer les tests unitaires dans une image distincte
+
+```sh
+docker build -f tests/docker-images/Dockerfile.unit -t rosettai-unit:local .
+docker run --rm rosettai-unit:local
+```
+
+Cette image exécute uniquement les tests unitaires du binaire Rust (`src/`).
+Elle ne lance aucune des suites d'intégration de `tests/`.
+
+L'image ci-dessous sert aux tests de chargement des vrais harnesses ; elle est
+distincte de l'image de la suite Rust.
+
 L'image fournit un environnement reproductible avec Codex CLI, GitHub Copilot
 CLI, VS Code Linux et son extension Copilot intégrée, ainsi que le binaire
 `rai`, Git et ripgrep. Elle s'exécute avec un utilisateur non privilégié.

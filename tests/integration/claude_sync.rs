@@ -35,12 +35,12 @@ fn projects_scoped_rules_and_cleans_stale_owned_files() {
 }
 
 #[test]
-fn unowned_claude_file_aborts_without_partial_writes() {
+fn unowned_claude_file_blocks_hook_without_partial_writes() {
     let repo = tempfile::tempdir().unwrap();
     fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
     fs::write(repo.path().join(".agents/rules/general.md"), "Global.\n").unwrap();
     fs::write(repo.path().join("CLAUDE.md"), "My instructions\n").unwrap();
-    let result = run(repo.path(), &["sync"]);
+    let result = run(repo.path(), &["sync", "--git-hook"]);
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("CLAUDE.md"));
     assert!(!repo.path().join("AGENTS.md").exists());

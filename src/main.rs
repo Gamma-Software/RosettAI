@@ -1,3 +1,4 @@
+use chrono::Local;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
@@ -65,12 +66,16 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Vec<String>) -> Result<(), String> {
+    if args.is_empty() {
+        return helper();
+    }
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(usage)?;
     let mut dry_run = false;
     let mut json = false;
     let mut perf = false;
     let mut codex_hook = false;
+    let mut git_hook = false;
     let mut repo = None;
     let mut roots = Vec::new();
     while let Some(arg) = args.next() {
@@ -79,10 +84,18 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--json" => json = true,
             "--perf" => perf = true,
             "--codex-hook" => codex_hook = true,
+            "--git-hook" => git_hook = true,
             "--repo" => repo = Some(PathBuf::from(args.next().ok_or("--repo needs a path")?)),
             "--root" => roots.push(PathBuf::from(args.next().ok_or("--root needs a path")?)),
             _ => return Err(format!("unknown option: {arg}")),
         }
+    }
+    if command == "help" {
+        if dry_run || json || codex_hook || git_hook || repo.is_some() || !roots.is_empty() {
+            return Err("help accepts only --perf".into());
+        }
+        print_help();
+        return Ok(());
     }
     if dry_run && command != "sync" {
         return Err("--dry-run is only valid with sync".into());
@@ -95,6 +108,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
     if codex_hook && command != "sync" {
         return Err("--codex-hook is only valid with sync".into());
+    }
+    if git_hook && command != "sync" {
+        return Err("--git-hook is only valid with sync".into());
+    }
+    if git_hook && (codex_hook || dry_run || json) {
+        return Err("--git-hook cannot be combined with --codex-hook, --dry-run, or --json".into());
     }
     if codex_hook && (dry_run || json) {
         return Err("--codex-hook cannot be combined with --dry-run or --json".into());
@@ -124,6 +143,69 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if command == "init" {
         return init(&start);
     }
+    if command == "migrate" {
+        return migrate(&start);
+    }
+    if command == "rollback" {
+        return rollback_migration(&start);
+    }
+    if command == "sync" && !codex_hook && !git_hook && !dry_run && !json {
+        let start = start.canonicalize().map_err(|e| e.to_string())?;
+        let root = git_root(&start).unwrap_or(start);
+        let rules = root.join(".agents/rules");
+        if rules.exists() || rules.is_symlink() {
+            read_rules(&root)?;
+        }
+        let mut native = native_sources(&root)?;
+        if !native.is_empty() {
+            while !native.is_empty() {
+                let previous = existing_migration_backup(&root)?;
+                let pending = if let Some(backup) = &previous {
+                    let manifest = read_migration_manifest(backup, &root)?;
+                    manifest["sources"].as_array().is_some_and(|sources| {
+                        sources.iter().any(|source| {
+                            source["path"]
+                                .as_str()
+                                .is_some_and(|path| native.iter().any(|p| p == path))
+                        })
+                    })
+                } else {
+                    false
+                };
+                if pending {
+                    if !finish_migration(&root, true)? {
+                        return Ok(());
+                    }
+                } else {
+                    migrate(&root)?;
+                    if existing_migration_backup(&root)? == previous {
+                        return Ok(());
+                    }
+                    finish_migration(&root, false)?;
+                }
+                native = native_sources(&root)?;
+            }
+            print!("Synchronize now? [y/N] ");
+            io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .map_err(|e| e.to_string())?;
+            if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                println!("Synchronization deferred");
+                return Ok(());
+            }
+        } else if !root.join(".agents").exists() {
+            init(&root)?;
+        }
+    }
+    if command == "sync" && git_hook {
+        match find_repo(&start) {
+            Ok(_) => {}
+            Err(error) if error.starts_with("no .agents/ directory found") => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
     let root = if codex_hook {
         match find_repo(&start) {
             Ok(root) => root,
@@ -138,8 +220,29 @@ fn run(args: Vec<String>) -> Result<(), String> {
             Ok::<PathBuf, String>(git_root(&start).unwrap_or(start))
         })?
     } else {
-        find_repo(&start)?
+        match find_repo(&start) {
+            Ok(root) => root,
+            Err(error) => {
+                if command == "sync" && json {
+                    println!("{{\"ok\":false,\"error\":{}}}", json_string(&error));
+                }
+                return Err(error);
+            }
+        }
     };
+    if command == "sync" && (git_hook || dry_run || json) {
+        let native = native_sources(&root)?;
+        if !native.is_empty() {
+            let error = format!(
+                "unmanaged native configuration: {}; run rai sync manually to review migration",
+                native.join(", ")
+            );
+            if json {
+                println!("{{\"ok\":false,\"error\":{}}}", json_string(&error));
+            }
+            return Err(error);
+        }
+    }
     match command.as_str() {
         "sync" if codex_hook => sync_codex_hook(&root),
         "sync" => sync_with_format(&root, dry_run, json),
@@ -150,8 +253,98 @@ fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: rai <install|uninstall|init|status|sync|doctor|update> [--repo PATH] [--root PATH] [--dry-run] [--json] [--codex-hook] [--perf]"
+    "usage: rai [help|init|sync|doctor|status|install|uninstall|migrate|rollback|update] [options]"
         .into()
+}
+
+fn print_help() {
+    println!(
+        "RosettAI CLI\n\nRun `rai` for the interactive helper.\n\nCommon commands:\n  rai sync               Set up the current project if needed, then synchronize\n  rai doctor             Diagnose and repair configuration problems\n  rai help               Show this help\n\nOther commands:\n  rai init               Create an empty canonical source tree or offer migration\n  rai status             Show projection status\n  rai install            Set up global Git hooks; optionally watch a directory (--root PATH)\n  rai uninstall          Remove machine integration\n  rai migrate            Import supported native instructions\n  rai rollback           Restore instructions from a migration backup\n  rai update             Update the CLI\n\nOptions: --repo PATH, --root PATH, --dry-run, --json, --perf\nRun `rai <command> --repo PATH` to target another project where supported."
+    );
+}
+
+fn helper() -> Result<(), String> {
+    if !io::stdin().is_terminal() {
+        print_help();
+        return Ok(());
+    }
+    let current = env::current_dir().map_err(|e| e.to_string())?;
+    loop {
+        let root = git_root(&current).unwrap_or_else(|| current.clone());
+        println!("\nRosettAI — {}", current.display());
+        if root.join(".agents").is_dir() {
+            println!("  Project: configured");
+        } else if !native_sources(&root)?.is_empty() {
+            println!("  Project: native configuration found; migration available");
+        } else {
+            println!("  Project: not configured");
+        }
+        println!("  1. Sync this project (set up if needed)");
+        println!("  2. Diagnose a problem");
+        println!("  3. Manage this machine");
+        println!("  4. Help");
+        print!("Choose an option (q to quit): ");
+        io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut choice = String::new();
+        if io::stdin()
+            .read_line(&mut choice)
+            .map_err(|e| e.to_string())?
+            == 0
+        {
+            return Ok(());
+        }
+        match choice.trim() {
+            "1" => run(vec![
+                "sync".into(),
+                "--repo".into(),
+                current.to_string_lossy().into_owned(),
+            ])?,
+            "2" => {
+                let root = find_repo(&current).unwrap_or(current.clone());
+                doctor(&root, false)?;
+            }
+            "3" => machine_helper(&current)?,
+            "4" => print_help(),
+            "q" | "Q" => return Ok(()),
+            _ => println!("Choose 1–4 or q."),
+        }
+    }
+}
+
+fn machine_helper(current: &Path) -> Result<(), String> {
+    println!(
+        "\nMachine integration:\n  1. Watch this directory\n  2. Choose a workspace directory\n  3. Update the CLI\n  4. Uninstall machine integration\n  5. Roll back project migration"
+    );
+    print!("Choose an option (Enter to return): ");
+    io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut choice = String::new();
+    io::stdin()
+        .read_line(&mut choice)
+        .map_err(|e| e.to_string())?;
+    match choice.trim() {
+        "1" => setup::setup(vec![current.to_path_buf()]),
+        "2" => {
+            print!("Workspace directory to watch: ");
+            io::stdout().flush().map_err(|e| e.to_string())?;
+            let mut path = String::new();
+            io::stdin()
+                .read_line(&mut path)
+                .map_err(|e| e.to_string())?;
+            if path.trim().is_empty() {
+                Ok(())
+            } else {
+                setup::setup(vec![PathBuf::from(path.trim())])
+            }
+        }
+        "3" => update::install(),
+        "4" => uninstall::uninstall(),
+        "5" => rollback_migration(current),
+        "" => Ok(()),
+        _ => {
+            println!("Choose 1–5 or press Enter.");
+            Ok(())
+        }
+    }
 }
 
 fn find_repo(start: &Path) -> Result<PathBuf, String> {
@@ -243,6 +436,14 @@ fn sync_codex_hook(root: &Path) -> Result<(), String> {
     io::stdin()
         .read_to_string(&mut input)
         .map_err(|e| e.to_string())?;
+    let native = native_sources(root)?;
+    if !native.is_empty() {
+        print_codex_hook_result(&format!(
+            "RosettAI found unmanaged native configuration: {}. Run rai sync manually to review migration.",
+            native.join(", ")
+        ));
+        return Ok(());
+    }
     let changes = match plan_sync(root) {
         Ok(changes) => changes,
         Err(error) => {
@@ -545,19 +746,825 @@ fn init(start: &Path) -> Result<(), String> {
         return Err(format!("not a directory: {}", start.display()));
     }
     let root = git_root(&start).unwrap_or(start);
+    let native = native_sources(&root)?;
+    if !native.is_empty() {
+        return migrate(&root);
+    }
     let agents = root.join(".agents");
     if agents.exists() || agents.is_symlink() {
         return Err(format!("already exists: {}", agents.display()));
     }
+    setup::ensure_first_setup(&root)?;
     fs::create_dir(&agents).map_err(|e| format!("{}: {e}", agents.display()))?;
-    fs::create_dir(agents.join("rules")).map_err(|e| e.to_string())?;
+    create_canonical_layout(&agents)?;
+    println!("Created {}", agents.display());
+    println!("Add resources under .agents/ when needed, then run rai sync");
+    Ok(())
+}
+
+fn create_canonical_layout(agents: &Path) -> Result<(), String> {
+    for directory in ["rules", "agents", "commands", "skills"] {
+        let path = agents.join(directory);
+        fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+        let keep = path.join(".keep");
+        if !keep.exists() {
+            fs::write(keep, "").map_err(|e| e.to_string())?;
+        }
+    }
+    let mcp = agents.join("mcp.yaml");
+    if !mcp.exists() && !agents.join("mcp.json").exists() {
+        fs::write(mcp, "servers: {}\n").map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+const IMPORTABLE_NATIVE: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".github/copilot-instructions.md"];
+const INSTRUCTION_NAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", "copilot-instructions.md"];
+
+fn instruction_scope(relative: &str) -> Result<String, String> {
+    if IMPORTABLE_NATIVE.contains(&relative) {
+        return Ok(String::new());
+    }
+    let path = Path::new(relative);
+    if relative.contains(['\\', '\n', '\r'])
+        || !path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        || !path
+            .file_name()
+            .is_some_and(|name| name == "AGENTS.md" || name == "CLAUDE.md")
+    {
+        return Err(format!("unsupported migration source: {relative}"));
+    }
+    let scope = path
+        .parent()
+        .and_then(Path::to_str)
+        .ok_or("invalid migration source path")?;
+    if scope.is_empty()
+        || Path::new(scope).components().any(|part| {
+            matches!(
+                part.as_os_str().to_str(),
+                Some(".git" | ".agents" | ".codex" | ".claude" | ".github" | ".cursor")
+            )
+        })
+    {
+        return Err(format!("unsupported migration source: {relative}"));
+    }
+    Ok(scope.to_owned())
+}
+
+fn nested_instruction_sources(
+    root: &Path,
+    directory: &Path,
+    found: &mut Vec<String>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|e| format!("{}: {e}", directory.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|e| e.to_string())?;
+        if kind.is_dir() {
+            // Harness internals, dependencies, build outputs, and fixture data are not project scopes.
+            if matches!(
+                entry.file_name().to_str(),
+                Some(
+                    ".git"
+                        | ".agents"
+                        | ".codex"
+                        | ".claude"
+                        | ".github"
+                        | ".cursor"
+                        | "node_modules"
+                        | "target"
+                        | "fixtures"
+                )
+            ) || path.join(".git").exists()
+                || path.join(".agents").exists()
+            {
+                continue;
+            }
+            nested_instruction_sources(root, &path, found)?;
+        } else if directory != root
+            && (kind.is_file() || kind.is_symlink())
+            && entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| matches!(name, "AGENTS.md" | "CLAUDE.md"))
+            && !owned_native_file(&path)?
+        {
+            found.push(
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .ok_or("non-UTF-8 migration path")?
+                    .replace('\\', "/"),
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn native_sources(root: &Path) -> Result<Vec<String>, String> {
+    let mut found = Vec::new();
+    for relative in IMPORTABLE_NATIVE {
+        let path = root.join(relative);
+        if (path.exists() || path.is_symlink()) && !owned_native_file(&path)? {
+            found.push(relative.to_string());
+        }
+    }
+    for directory in [
+        ".claude/rules",
+        ".claude/agents",
+        ".claude/skills",
+        ".claude/commands",
+        ".github/instructions",
+        ".github/agents",
+        ".github/prompts",
+        ".codex/agents",
+        ".codex/rules",
+        ".codex/skills",
+        ".cursor/rules",
+        ".cursor/agents",
+        ".cursor/skills",
+        ".cursor/commands",
+    ] {
+        let dir = root.join(directory);
+        if dir.is_symlink() {
+            found.push(directory.to_string());
+        } else if dir.is_dir() {
+            for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+                let entry = entry.map_err(|e| e.to_string())?;
+                let path = entry.path();
+                if (path.is_symlink() || path.is_file() || path.is_dir())
+                    && !owned_native_file(&path)?
+                {
+                    found.push(
+                        path.strip_prefix(root)
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+            }
+        }
+    }
+    for relative in [
+        ".codex/config.toml",
+        ".claude/settings.json",
+        ".github/copilot-mcp.json",
+        ".mcp.json",
+        ".vscode/mcp.json",
+        ".cursor/mcp.json",
+    ] {
+        let path = root.join(relative);
+        if (path.exists() || path.is_symlink()) && !owned_native_file(&path)? {
+            found.push(relative.to_string());
+        }
+    }
+    nested_instruction_sources(root, root, &mut found)?;
+    found.sort();
+    Ok(found)
+}
+
+fn owned_native_file(path: &Path) -> Result<bool, String> {
+    if path.is_symlink() {
+        return Ok(false);
+    }
+    if path.is_dir() {
+        let skill = path.join("SKILL.md");
+        return Ok(skill.is_file()
+            && !skill.is_symlink()
+            && fs::read_dir(path).map_err(|e| e.to_string())?.count() == 1
+            && owned_native_file(&skill)?);
+    }
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let content = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(match path.extension().and_then(|ext| ext.to_str()) {
+        Some("toml") => is_owned_comment(&content),
+        Some("json") => is_owned_json(&content) || is_owned_slash_comment(&content),
+        _ => is_owned(&content, ""),
+    })
+}
+
+fn migration_base() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    let base = user_data::config_dir()?;
+    #[cfg(not(windows))]
+    let base = PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?).join(".rai");
+    let migrations = base.join("migrations");
+    for path in [&base, &migrations] {
+        if path.is_symlink() || (path.exists() && !path.is_dir()) {
+            return Err(format!(
+                "migration backup directory conflict: {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(migrations)
+}
+
+fn migration_project_dir(root: &Path) -> Result<PathBuf, String> {
+    let name = root
+        .file_name()
+        .filter(|name| !name.is_empty())
+        .ok_or("cannot name migration backup for filesystem root")?;
+    let project = migration_base()?.join(name);
+    if project.is_symlink() || (project.exists() && !project.is_dir()) {
+        return Err(format!(
+            "migration backup directory conflict: {}",
+            project.display()
+        ));
+    }
+    Ok(project)
+}
+
+fn migration_backup(root: &Path) -> Result<PathBuf, String> {
+    let project = migration_project_dir(root)?;
+    let timestamp = Local::now().format("%Y-%m-%d_%H-%M-%S").to_string();
+    for suffix in 1..=1000 {
+        let name = if suffix == 1 {
+            timestamp.clone()
+        } else {
+            format!("{timestamp}-{suffix}")
+        };
+        let candidate = project.join(name);
+        if !candidate.exists() && !candidate.is_symlink() {
+            return Ok(candidate);
+        }
+    }
+    Err("no available migration backup directory for this second".into())
+}
+
+fn find_manifest_backup(directory: &Path, root: &Path) -> Result<Option<PathBuf>, String> {
+    if directory.is_dir() {
+        let mut entries = fs::read_dir(directory)
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries.into_iter().rev() {
+            if !entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                continue;
+            }
+            let backup = entry.path();
+            let manifest_path = backup.join("manifest.json");
+            if !manifest_path.is_file() || manifest_path.is_symlink() {
+                continue;
+            }
+            let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(
+                &fs::read(&manifest_path).map_err(|e| e.to_string())?,
+            ) else {
+                continue;
+            };
+            if manifest["repository"] == root.to_string_lossy().as_ref() {
+                return Ok(Some(backup));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn existing_migration_backup(root: &Path) -> Result<Option<PathBuf>, String> {
+    let base = migration_base()?;
+    let project = migration_project_dir(root)?;
+    if let Some(backup) = find_manifest_backup(&project, root)? {
+        return Ok(Some(backup));
+    }
+    if let Some(backup) = find_manifest_backup(&base, root)? {
+        return Ok(Some(backup));
+    }
+    let previous = base.join(sha256_hex(root.to_string_lossy().as_bytes()));
+    if previous.join("manifest.json").is_file() {
+        return Ok(Some(previous));
+    }
+    let legacy = root.join(".agents/migration-backup");
+    if legacy.join("manifest.json").is_file() {
+        return Ok(Some(legacy));
+    }
+    Ok(None)
+}
+
+fn read_migration_manifest(backup: &Path, root: &Path) -> Result<serde_json::Value, String> {
+    let path = backup.join("manifest.json");
+    if has_symlink_component(backup, &path) || backup.is_symlink() {
+        return Err("symlink migration backup conflict".into());
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("migration manifest: {e}"))?;
+    if manifest["repository"]
+        .as_str()
+        .is_some_and(|repository| repository != root.to_string_lossy())
+    {
+        return Err("migration backup belongs to another repository".into());
+    }
+    Ok(manifest)
+}
+
+struct MigratedRule {
+    path: String,
+    hash: String,
+    scope: String,
+    name: Option<String>,
+}
+
+fn manifest_rules(manifest: &serde_json::Value) -> Result<Vec<MigratedRule>, String> {
+    if manifest["version"] == 1 && manifest["generated"] == ".agents/rules/migrated-harness.md" {
+        return Ok(vec![MigratedRule {
+            path: ".agents/rules/migrated-harness.md".into(),
+            hash: manifest["generatedSha256"]
+                .as_str()
+                .ok_or("invalid migration manifest hash")?
+                .into(),
+            scope: String::new(),
+            name: manifest["generatedName"].as_str().map(str::to_owned),
+        }]);
+    }
+    if manifest["version"] != 2 {
+        return Err("unsupported migration manifest".into());
+    }
+    let mut paths = HashSet::new();
+    let mut scopes = HashSet::new();
+    let rules = manifest["generatedRules"]
+        .as_array()
+        .ok_or("invalid migration manifest rules")?;
+    if rules.is_empty() {
+        return Err("empty migration manifest rules".into());
+    }
+    rules
+        .iter()
+        .map(|rule| {
+            let path = rule["path"].as_str().ok_or("invalid migrated rule path")?;
+            let file = Path::new(path);
+            let scope = rule["scope"]
+                .as_str()
+                .ok_or("invalid migrated rule scope")?;
+            if file.parent() != Some(Path::new(".agents/rules"))
+                || file.extension().is_none_or(|ext| ext != "md")
+                || !paths.insert(path)
+                || !scopes.insert(scope)
+                || (!scope.is_empty() && instruction_scope(&format!("{scope}/AGENTS.md"))? != scope)
+            {
+                return Err("invalid migrated rule path or scope".into());
+            }
+            Ok(MigratedRule {
+                path: path.into(),
+                hash: rule["sha256"]
+                    .as_str()
+                    .ok_or("invalid migrated rule hash")?
+                    .into(),
+                scope: scope.into(),
+                name: rule["name"].as_str().map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
+fn render_migrated_rules(bodies: &[(String, String)]) -> Result<BTreeMap<String, String>, String> {
+    let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (relative, body) in bodies {
+        sections
+            .entry(instruction_scope(relative)?)
+            .or_default()
+            .push(format!("## From {relative}\n\n{}", body.trim()));
+    }
+    Ok(sections
+        .into_iter()
+        .map(|(scope, sections)| {
+            let prefix = if scope.is_empty() {
+                String::new()
+            } else {
+                format!("---\npath: {scope}\n---\n\n")
+            };
+            let content = format!(
+                "{prefix}# Migrated harness instructions\n\n{}\n",
+                sections.join("\n\n")
+            );
+            (scope, content)
+        })
+        .collect())
+}
+
+fn with_rule_name(content: &str, name: &str) -> Result<String, String> {
+    let (scope, _, body) = parse_rule(content)?;
+    let metadata = if scope.is_empty() {
+        serde_json::json!({"name": name})
+    } else {
+        serde_json::json!({"name": name, "path": scope})
+    };
+    let yaml = serde_yaml::to_string(&metadata).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "---\n{yaml}---\n\n{}",
+        body.trim_start_matches('\n')
+    ))
+}
+
+fn finish_migration(root: &Path, confirm: bool) -> Result<bool, String> {
+    let backup = existing_migration_backup(root)?.ok_or("migration backup missing")?;
+    let manifest = read_migration_manifest(&backup, root)?;
+    let rules = manifest_rules(&manifest)?;
+    let sources = manifest["sources"]
+        .as_array()
+        .ok_or("invalid migration manifest sources")?;
+    let mut bodies = Vec::new();
+    let mut tracked = Vec::new();
+    for source in sources {
+        let relative = source["path"].as_str().ok_or("invalid migration source")?;
+        instruction_scope(relative)?;
+        let saved = backup.join(relative);
+        let original = root.join(relative);
+        if has_symlink_component(&backup, &saved) || has_symlink_component(root, &original) {
+            return Err(format!("symlink migration source conflict: {relative}"));
+        }
+        let body = fs::read_to_string(&saved).map_err(|e| format!("{}: {e}", saved.display()))?;
+        let hash = source["sha256"]
+            .as_str()
+            .ok_or("invalid migration source hash")?;
+        if sha256_hex(body.as_bytes()) != hash {
+            return Err(format!("migration backup changed: {relative}"));
+        }
+        bodies.push((relative.to_owned(), body));
+        if is_tracked(root, relative)? {
+            if !original.is_file()
+                || sha256_hex(&fs::read(&original).map_err(|e| e.to_string())?) != hash
+            {
+                return Err(format!("tracked migration source changed: {relative}"));
+            }
+            let staged = Command::new("git")
+                .args(["show", &format!(":{relative}")])
+                .current_dir(root)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !staged.status.success() || sha256_hex(&staged.stdout) != hash {
+                return Err(format!("staged migration source changed: {relative}"));
+            }
+            tracked.push(relative.to_string());
+        } else if original.exists() || original.is_symlink() {
+            return Err(format!("untracked migration source reappeared: {relative}"));
+        }
+    }
+    let mut generated = render_migrated_rules(&bodies)?;
+    if generated.len() != rules.len() {
+        return Err("migration manifest does not match saved instructions".into());
+    }
+    for rule in &rules {
+        if let Some(name) = &rule.name {
+            let body = generated
+                .get_mut(&rule.scope)
+                .ok_or("missing migrated rule scope")?;
+            *body = with_rule_name(body, name)?;
+        }
+        let target = root.join(&rule.path);
+        let body = generated
+            .get(&rule.scope)
+            .ok_or("missing migrated rule scope")?;
+        parse_rule(body).map_err(|e| format!("{}: {e}", rule.path))?;
+        if has_symlink_component(root, &target) {
+            return Err("symlink migrated rule conflict".into());
+        }
+        if sha256_hex(body.as_bytes()) != rule.hash {
+            return Err("migration manifest does not match saved instructions".into());
+        }
+        if target.exists() && fs::read(&target).map_err(|e| e.to_string())? != body.as_bytes() {
+            return Err("migrated rule changed; review it before resuming migration".into());
+        }
+    }
+    if confirm {
+        println!("Resume migration for {}:", root.display());
+        for rule in &rules {
+            if !root.join(&rule.path).exists() {
+                println!("  Restore {} from the verified backup", rule.path);
+            }
+        }
+        for relative in &tracked {
+            println!(
+                "  Remove tracked {relative} from Git and replace it with a generated projection"
+            );
+        }
+        print!("Proceed? [y/N] ");
+        io::stdout().flush().map_err(|e| e.to_string())?;
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .map_err(|e| e.to_string())?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("Migration deferred; no files changed");
+            return Ok(false);
+        }
+    }
+    for rule in &rules {
+        let target = root.join(&rule.path);
+        if !target.exists() {
+            fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+            fs::write(&target, &generated[&rule.scope]).map_err(|e| e.to_string())?;
+        }
+    }
+    for relative in &tracked {
+        let removed = Command::new("git")
+            .args(["rm", "--cached", "-q", "--", relative])
+            .current_dir(root)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !removed.success() {
+            return Err(format!(
+                "cannot remove tracked migration source from Git: {relative}"
+            ));
+        }
+        fs::remove_file(root.join(relative)).map_err(|e| format!("{relative}: {e}"))?;
+    }
+    Ok(true)
+}
+
+fn migrate(start: &Path) -> Result<(), String> {
+    let start = start
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", start.display()))?;
+    let root = git_root(&start).unwrap_or(start);
+    let found = native_sources(&root)?;
+    if found.is_empty() {
+        return Err("no unmanaged harness configuration found to migrate".into());
+    }
+    let unsupported = found
+        .iter()
+        .filter(|path| instruction_scope(path).is_err())
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        return Err(format!(
+            "migration requires manual conversion of: {}; copy these resources into .agents/ before running rai sync",
+            unsupported
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let mut tracked = Vec::new();
+    for relative in &found {
+        if has_symlink_component(&root, &root.join(relative)) {
+            return Err(format!("symlink migration source conflict: {relative}"));
+        }
+        if is_tracked(&root, relative)? {
+            tracked.push(relative.as_str());
+        }
+    }
+    let agents = root.join(".agents");
+    if agents.is_symlink() {
+        return Err("symlink source conflict: .agents".into());
+    }
+    let backup = migration_backup(&root)?;
+    if backup.exists() || backup.is_symlink() {
+        return Err("migration destination or backup already exists".into());
+    }
+    let mut bodies = Vec::new();
+    let mut sources = Vec::new();
+    for relative in &found {
+        let body =
+            fs::read_to_string(root.join(relative)).map_err(|e| format!("{relative}: {e}"))?;
+        sources.push(serde_json::json!({"path": relative, "sha256": sha256_hex(body.as_bytes())}));
+        bodies.push((relative.to_owned(), body));
+    }
+    for (relative, body) in &bodies {
+        if tracked.contains(&relative.as_str()) {
+            let staged = Command::new("git")
+                .args(["show", &format!(":{relative}")])
+                .current_dir(&root)
+                .output()
+                .map_err(|e| e.to_string())?;
+            if !staged.status.success() || staged.stdout != body.as_bytes() {
+                return Err(format!("staged migration source changed: {relative}"));
+            }
+        }
+    }
+    let mut generated = render_migrated_rules(&bodies)?;
+    let mut rules = Vec::new();
+    for (scope, body) in &mut generated {
+        let name = if scope.is_empty() {
+            "migrated-harness".to_string()
+        } else {
+            format!("AGENTS-{}", scope.replace('/', "-"))
+        };
+        let mut relative = format!(".agents/rules/{name}.md");
+        if scope.is_empty() && root.join(&relative).exists() {
+            relative = format!(
+                ".agents/rules/{name}-{}.md",
+                backup.file_name().unwrap().to_string_lossy()
+            );
+        }
+        let target = root.join(&relative);
+        if target.exists()
+            || has_symlink_component(&root, &target)
+            || rules.iter().any(|rule: &serde_json::Value| {
+                rule["path"]
+                    .as_str()
+                    .is_some_and(|path| path.eq_ignore_ascii_case(&relative))
+            })
+        {
+            return Err(format!("migration destination conflict: {relative}"));
+        }
+        let original_name = INSTRUCTION_NAMES
+            .into_iter()
+            .find(|name| {
+                bodies.iter().any(|(source, _)| {
+                    Path::new(source).file_name().and_then(|file| file.to_str()) == Some(*name)
+                        && instruction_scope(source)
+                            .is_ok_and(|source_scope| source_scope == scope.as_str())
+                })
+            })
+            .ok_or("missing migration source for rule scope")?;
+        *body = with_rule_name(body, original_name)?;
+        parse_rule(body)?;
+        rules.push(serde_json::json!({"path": relative, "scope": scope, "name": original_name, "sha256": sha256_hex(body.as_bytes())}));
+    }
+    println!("Migration proposed for {}:", root.display());
+    for relative in &found {
+        if tracked.contains(&relative.as_str()) {
+            println!(
+                "  Copy tracked {relative} -> {}/{relative}; remove it from Git before generating its projection",
+                backup.display()
+            );
+        } else {
+            println!("  Move {relative} -> {}/{relative}", backup.display());
+        }
+    }
+    for rule in &rules {
+        println!(
+            "  Create {} from these instructions (scope: {})",
+            rule["path"].as_str().unwrap(),
+            if rule["scope"] == "" {
+                "repository"
+            } else {
+                rule["scope"].as_str().unwrap()
+            }
+        );
+    }
+    println!(
+        "  Record {}/manifest.json for `rai rollback`",
+        backup.display()
+    );
+    print!("Proceed with migration? [y/N] ");
+    io::stdout().flush().map_err(|e| e.to_string())?;
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("Migration cancelled; no files changed");
+        return Ok(());
+    }
+    for (relative, body) in &bodies {
+        if has_symlink_component(&root, &root.join(relative))
+            || fs::read(root.join(relative)).map_err(|e| e.to_string())? != body.as_bytes()
+        {
+            return Err(format!(
+                "migration source changed during confirmation: {relative}"
+            ));
+        }
+    }
+    let legacy = rules.len() == 1
+        && rules[0]["path"] == ".agents/rules/migrated-harness.md"
+        && rules[0]["scope"] == "";
+    let mut manifest = serde_json::json!({
+        "version": if legacy { 1 } else { 2 },
+        "repository": root.to_string_lossy(),
+        "createdAgents": !agents.exists(),
+        "sources": sources,
+    });
+    if legacy {
+        manifest["generated"] = serde_json::json!(".agents/rules/migrated-harness.md");
+        manifest["generatedSha256"] = rules[0]["sha256"].clone();
+        manifest["generatedName"] = rules[0]["name"].clone();
+    } else {
+        manifest["generatedRules"] = serde_json::json!(rules);
+    }
+    fs::create_dir_all(backup.parent().unwrap()).map_err(|e| e.to_string())?;
+    fs::create_dir(&backup).map_err(|e| format!("{}: {e}", backup.display()))?;
+    for relative in &found {
+        let saved = backup.join(relative);
+        fs::create_dir_all(saved.parent().unwrap()).map_err(|e| e.to_string())?;
+        fs::copy(root.join(relative), &saved).map_err(|e| format!("{relative}: {e}"))?;
+    }
     fs::write(
-        agents.join("rules/general.md"),
-        "# Project rules\n\nFollow the repository's existing conventions. Keep changes focused and run the relevant tests.\n",
+        backup.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    println!("Created {}", agents.display());
-    println!("Edit .agents/rules/general.md, then run rai sync --dry-run");
+    create_canonical_layout(&agents)?;
+    for rule in &rules {
+        fs::write(
+            root.join(rule["path"].as_str().unwrap()),
+            &generated[rule["scope"].as_str().unwrap()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for relative in &found {
+        if !tracked.contains(&relative.as_str()) {
+            fs::remove_file(root.join(relative)).map_err(|e| format!("{relative}: {e}"))?;
+        }
+    }
+    println!(
+        "Migrated {} native instruction file(s) into {} canonical rule(s)",
+        found.len(),
+        rules.len()
+    );
+    println!(
+        "Originals saved under {}. Review the rules, then run rai sync --dry-run",
+        backup.display()
+    );
+    setup::ensure_first_setup(&root)?;
+    Ok(())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn has_symlink_component(root: &Path, path: &Path) -> bool {
+    path.ancestors()
+        .take_while(|part| *part != root)
+        .any(Path::is_symlink)
+}
+
+fn rollback_migration(start: &Path) -> Result<(), String> {
+    let start = start
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", start.display()))?;
+    let root = git_root(&start).unwrap_or(start);
+    let backup =
+        existing_migration_backup(&root)?.ok_or("no migration backup found for this repository")?;
+    let manifest = read_migration_manifest(&backup, &root)?;
+    let rules = manifest_rules(&manifest)?;
+    for rule in &rules {
+        let target = root.join(&rule.path);
+        if has_symlink_component(&root, &target)
+            || !target.is_file()
+            || sha256_hex(&fs::read(&target).map_err(|e| e.to_string())?) != rule.hash
+        {
+            return Err("migrated rules changed; review them before rollback".into());
+        }
+    }
+    let sources = manifest["sources"]
+        .as_array()
+        .ok_or("invalid migration manifest sources")?;
+    for source in sources {
+        let relative = source["path"].as_str().ok_or("invalid migration source")?;
+        instruction_scope(relative)?;
+        let saved = backup.join(relative);
+        let original = root.join(relative);
+        if has_symlink_component(&backup, &saved)
+            || !saved.is_file()
+            || sha256_hex(&fs::read(&saved).map_err(|e| e.to_string())?)
+                != source["sha256"]
+                    .as_str()
+                    .ok_or("invalid migration source hash")?
+        {
+            return Err(format!("migration backup changed: {relative}"));
+        }
+        if has_symlink_component(&root, &original) {
+            return Err(format!("symlink rollback conflict: {relative}"));
+        }
+        if original.exists() || original.is_symlink() {
+            if original.is_file()
+                && !original.is_symlink()
+                && sha256_hex(&fs::read(&original).map_err(|e| e.to_string())?)
+                    == source["sha256"]
+                        .as_str()
+                        .ok_or("invalid migration source hash")?
+            {
+                continue;
+            }
+            let owned_projection = !original.is_symlink()
+                && original.is_file()
+                && !is_tracked(&root, relative)?
+                && is_owned(
+                    &fs::read_to_string(&original).map_err(|e| e.to_string())?,
+                    "",
+                );
+            if !owned_projection {
+                return Err(format!("rollback conflict: {relative} already exists"));
+            }
+        }
+    }
+    for source in sources {
+        let relative = source["path"].as_str().unwrap();
+        let original = root.join(relative);
+        if original.is_file()
+            && sha256_hex(&fs::read(&original).map_err(|e| e.to_string())?)
+                == source["sha256"].as_str().unwrap()
+        {
+            continue;
+        }
+        fs::create_dir_all(original.parent().unwrap()).map_err(|e| e.to_string())?;
+        fs::copy(backup.join(relative), &original).map_err(|e| format!("{relative}: {e}"))?;
+    }
+    for rule in &rules {
+        fs::remove_file(root.join(&rule.path)).map_err(|e| e.to_string())?;
+    }
+    println!(
+        "Restored {} original instruction file(s); backup retained at {}",
+        sources.len(),
+        backup.display()
+    );
     Ok(())
 }
 
@@ -614,7 +1621,7 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
     if !root.join(".agents").exists() {
         issues.push(DoctorIssue {
             message: "no .agents/ directory in this repository".into(),
-            solution: "Run rai init to create a starter .agents/rules/general.md; review and customize its content after initialization.".into(),
+            solution: "Run rai sync to create an empty .agents/ source tree, then add the resources your project needs.".into(),
             fix: Some(DoctorFix::Init),
         });
     } else {
@@ -646,7 +1653,7 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
     {
         issues.push(DoctorIssue {
             message: "unmanaged AGENTS.md exists".into(),
-            solution: "Review and copy its instructions into .agents/rules/, then remove or relocate AGENTS.md after confirming the new source. Automatic import is not implemented.".into(),
+            solution: "Run rai migrate to import untracked root instructions, or manually convert tracked native files before sync.".into(),
             fix: None,
         });
     }
@@ -693,13 +1700,14 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
 }
 
 fn solution_for_plan_error(error: &str) -> String {
-    if error.starts_with("tracked output conflict:") {
+    if error.contains("unsupported rule name:") {
+        "Set the rule's name to its original instruction filename: AGENTS.md, CLAUDE.md, or copilot-instructions.md. Use path to select its repository directory.".into()
+    } else if error.starts_with("tracked output conflict:") {
         "Review and move the tracked instructions into .agents/rules/, then remove the native file from Git tracking before running rai sync. Adding .gitignore alone will not untrack it.".into()
     } else if error.starts_with("unowned or modified output conflict:") {
         "Back up and review the native file, transfer its intended rules into .agents/rules/, then move the conflicting file aside before running rai sync.".into()
-    } else if error.starts_with("missing rules directory:") || error.starts_with("no .md rules in")
-    {
-        "Create at least one global Markdown rule in .agents/rules/, then run rai sync.".into()
+    } else if error.starts_with("missing rules directory:") {
+        "Create .agents/rules/ and add rules there when needed, then run rai sync.".into()
     } else if error.starts_with("scoped rule target is not a regular directory:") {
         "Create the target repository directory or remove the rule's path frontmatter to make it global.".into()
     } else if error.starts_with("malformed RosettAI block") {
@@ -980,6 +1988,25 @@ fn json_string(value: &str) -> String {
 }
 
 fn read_rules(root: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let commands = root.join(".agents/commands");
+    if commands.is_symlink() {
+        return Err("symlink source unsupported: .agents/commands".into());
+    }
+    if commands.exists() {
+        for entry in fs::read_dir(&commands).map_err(|e| e.to_string())? {
+            let path = entry.map_err(|e| e.to_string())?.path();
+            if path.file_name().is_some_and(|name| name == ".keep")
+                && path.is_file()
+                && !path.is_symlink()
+            {
+                continue;
+            }
+            return Err(format!(
+                "command projection is not supported yet: {}",
+                path.display()
+            ));
+        }
+    }
     let dir = root.join(".agents/rules");
     if dir.is_symlink() || dir.parent().is_some_and(Path::is_symlink) {
         return Err(format!("symlink source unsupported: {}", dir.display()));
@@ -988,7 +2015,6 @@ fn read_rules(root: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
         return Err(format!("missing rules directory: {}", dir.display()));
     }
     let mut sections: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut count = 0;
     {
         let mut files = fs::read_dir(&dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?
@@ -996,6 +2022,12 @@ fn read_rules(root: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
             .collect::<Result<Vec<_>, _>>()?;
         files.sort();
         for path in files {
+            if path.file_name().is_some_and(|name| name == ".keep")
+                && path.is_file()
+                && !path.is_symlink()
+            {
+                continue;
+            }
             if path.is_symlink() {
                 return Err(format!("symlink rule unsupported: {}", path.display()));
             }
@@ -1008,11 +2040,10 @@ fn read_rules(root: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
             if path.extension().is_none_or(|ext| ext != "md") {
                 return Err(format!("only .md rules are supported: {}", path.display()));
             }
-            count += 1;
             let source = path.strip_prefix(&dir).map_err(|e| e.to_string())?;
             let content =
                 fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let (scope, body) =
+            let (scope, name, body) =
                 parse_rule(&content).map_err(|e| format!("{}: {e}", path.display()))?;
             if !scope.is_empty() {
                 let target = root.join(&scope);
@@ -1025,48 +2056,74 @@ fn read_rules(root: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
             }
             sections.entry(scope).or_default().push(format!(
                 "## {}\n\n{}",
-                source.display(),
+                name.unwrap_or_else(|| source.to_string_lossy().into_owned()),
                 body.trim()
             ));
         }
     }
-    if count == 0 {
-        return Err(format!("no .md rules in {}", dir.display()));
-    }
     Ok(sections)
 }
 
-fn parse_rule(content: &str) -> Result<(String, &str), String> {
+fn parse_rule(content: &str) -> Result<(String, Option<String>, &str), String> {
     let Some(rest) = content.strip_prefix("---\n") else {
-        return Ok((String::new(), content));
+        return Ok((String::new(), None, content));
     };
     let (metadata, body) = rest
         .split_once("\n---\n")
         .ok_or("unterminated rule frontmatter")?;
-    let mut scope = None;
-    for line in metadata.lines() {
-        let value = line
-            .strip_prefix("path: ")
-            .ok_or("unsupported rule frontmatter field; expected `path: <directory>`")?;
-        if scope.is_some() {
-            return Err("duplicate rule path".into());
-        }
-        let value = value.trim();
-        if value == "." {
-            scope = Some(String::new());
-        } else if value.is_empty()
-            || value.contains('\\')
-            || !Path::new(value)
-                .components()
-                .all(|part| matches!(part, std::path::Component::Normal(_)))
-        {
-            return Err(format!("invalid rule path: {value}"));
-        } else {
-            scope = Some(value.to_owned());
+    let metadata: serde_yaml::Value =
+        serde_yaml::from_str(metadata).map_err(|e| format!("invalid rule frontmatter: {e}"))?;
+    let fields = metadata
+        .as_mapping()
+        .ok_or("rule frontmatter must be an object")?;
+    if fields.is_empty() {
+        return Err("rule frontmatter requires `type`, `name` or `path`".into());
+    }
+    let mut scope = String::new();
+    let mut name = None;
+    for (field, value) in fields {
+        match field.as_str() {
+            Some("type") => {
+                if value.as_str() != Some("rule") {
+                    return Err("rule type must be `rule` in .agents/rules".into());
+                }
+            }
+            Some("name") => {
+                let value = value.as_str().ok_or("rule name must be a string")?;
+                if value.trim().is_empty() || value.chars().any(char::is_control) {
+                    return Err("rule name must be a nonempty single-line string".into());
+                }
+                if !INSTRUCTION_NAMES.contains(&value) {
+                    return Err(format!(
+                        "unsupported rule name: {value}; expected AGENTS.md, CLAUDE.md or copilot-instructions.md"
+                    ));
+                }
+                name = Some(value.to_owned());
+            }
+            Some("path") => {
+                let value = value.as_str().ok_or("rule path must be a string")?.trim();
+                if value == "." {
+                    scope = String::new();
+                } else if value.is_empty()
+                    || value.contains('\\')
+                    || value.chars().any(char::is_control)
+                    || !Path::new(value)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+                {
+                    return Err(format!("invalid rule path: {value}"));
+                } else {
+                    scope = value.to_owned();
+                }
+            }
+            _ => {
+                return Err(
+                    "unsupported rule frontmatter field; expected `type`, `name` or `path`".into(),
+                );
+            }
         }
     }
-    let scope = scope.ok_or("rule frontmatter requires `path: <directory>`")?;
-    Ok((scope, body))
+    Ok((scope, name, body))
 }
 
 fn managed_output_paths(ignore: &str) -> Result<Vec<String>, String> {
@@ -1261,7 +2318,7 @@ mod tests {
     #[test]
     fn codex_projection_converts_rules_mcp_and_preserves_skills() {
         let dir = repo();
-        fs::write(dir.path().join(".agents/mcp.json"), r#"{"servers":{"docs":{"transport":"http","url":"https://example.com/mcp","bearer_token_env_var":"DOCS_TOKEN"},"local":{"transport":"stdio","command":"npx","args":["-y","example-mcp"],"env_vars":["LOCAL_TOKEN"],"default_tools_approval_mode":"approve"}}}"#).unwrap();
+        fs::write(dir.path().join(".agents/mcp.yaml"), "servers:\n  docs:\n    transport: http\n    url: https://example.com/mcp\n    bearer_token_env_var: DOCS_TOKEN\n  local:\n    transport: stdio\n    command: npx\n    args: [-y, example-mcp]\n    env_vars: [LOCAL_TOKEN]\n    default_tools_approval_mode: approve\n").unwrap();
         fs::create_dir_all(dir.path().join(".agents/skills/checks")).unwrap();
         fs::write(
             dir.path().join(".agents/skills/checks/SKILL.md"),
@@ -1323,13 +2380,13 @@ mod tests {
     }
 
     #[test]
-    fn canonical_yaml_subagents_are_projected() {
+    fn canonical_markdown_subagents_are_projected() {
         let dir = repo();
         fs::create_dir_all(dir.path().join(".agents/subagents")).unwrap();
-        let source = dir.path().join(".agents/subagents/reviewer.yaml");
+        let source = dir.path().join(".agents/subagents/reviewer.md");
         fs::write(
             &source,
-            "name: reviewer\ndescription: Review changes\nmodel: gpt-6-luna\nmodel_reasoning_effort: high\nsandbox_mode: read-only\nnickname_candidates: [Atlas, Delta]\ndeveloper_instructions: |\n  Check tests and regressions.\n",
+            "---\nname: reviewer\ndescription: Review changes\nmodel: gpt-6-luna\nmodel_reasoning_effort: high\nsandbox_mode: read-only\nnickname_candidates: [Atlas, Delta]\n---\n\nCheck tests and regressions.\n",
         )
         .unwrap();
         sync(dir.path(), false).unwrap();
@@ -1357,13 +2414,13 @@ mod tests {
     }
 
     #[test]
-    fn removing_yaml_subagent_removes_only_owned_projection() {
+    fn removing_markdown_subagent_removes_only_owned_projection() {
         let dir = repo();
         fs::create_dir_all(dir.path().join(".agents/subagents")).unwrap();
-        let source = dir.path().join(".agents/subagents/reviewer.yaml");
+        let source = dir.path().join(".agents/subagents/reviewer.md");
         fs::write(
             &source,
-            "name: reviewer\ndescription: Review changes\ndeveloper_instructions: Check tests.\n",
+            "---\nname: reviewer\ndescription: Review changes\n---\n\nCheck tests.\n",
         )
         .unwrap();
         sync(dir.path(), false).unwrap();
@@ -1374,6 +2431,43 @@ mod tests {
         assert!(!projection.exists());
         let config = fs::read_to_string(dir.path().join(".codex/config.toml")).unwrap();
         assert!(!config.contains("agents.reviewer"));
+    }
+
+    #[test]
+    fn legacy_sources_remain_supported_without_ambiguous_duplicates() {
+        let dir = repo();
+        fs::create_dir_all(dir.path().join(".agents/subagents")).unwrap();
+        fs::write(
+            dir.path().join(".agents/subagents/reviewer.yaml"),
+            "name: reviewer\ndescription: Review changes\ndeveloper_instructions: Check tests.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(".agents/mcp.json"),
+            r#"{"servers":{"docs":{"transport":"http","url":"https://example.com/mcp"}}}"#,
+        )
+        .unwrap();
+        sync(dir.path(), false).unwrap();
+        assert!(dir.path().join(".codex/agents/reviewer.toml").exists());
+        fs::write(
+            dir.path().join(".agents/subagents/reviewer.md"),
+            "---\nname: reviewer\ndescription: Review changes\n---\n\nCheck tests.\n",
+        )
+        .unwrap();
+        assert!(
+            plan_sync(dir.path())
+                .err()
+                .unwrap()
+                .contains("duplicate subagent name")
+        );
+        fs::remove_file(dir.path().join(".agents/subagents/reviewer.md")).unwrap();
+        fs::write(dir.path().join(".agents/mcp.yaml"), "servers: {}\n").unwrap();
+        assert!(
+            plan_sync(dir.path())
+                .err()
+                .unwrap()
+                .contains("both .agents/mcp.yaml and .agents/mcp.json")
+        );
     }
 
     #[test]

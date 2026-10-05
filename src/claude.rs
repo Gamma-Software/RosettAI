@@ -43,6 +43,12 @@ pub fn outputs(
             .collect::<Result<Vec<_>, _>>()?;
         entries.sort();
         for skill in entries {
+            if skill.file_name().is_some_and(|name| name == ".keep")
+                && skill.is_file()
+                && !skill.is_symlink()
+            {
+                continue;
+            }
             let name = skill.file_name().unwrap().to_string_lossy();
             for entry in fs::read_dir(&skill).map_err(|e| e.to_string())? {
                 let path = entry.map_err(|e| e.to_string())?.path();
@@ -61,10 +67,7 @@ pub fn outputs(
             ));
         }
     }
-    let mcp_path = root.join(".agents/mcp.json");
-    if mcp_path.is_file() {
-        let source = fs::read_to_string(&mcp_path).map_err(|e| e.to_string())?;
-        let source: Value = serde_json::from_str(&source).map_err(|e| e.to_string())?;
+    if let Some(source) = crate::codex::read_mcp(root)? {
         let servers = source["servers"]
             .as_object()
             .ok_or("MCP servers must be an object")?;

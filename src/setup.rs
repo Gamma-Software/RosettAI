@@ -1,13 +1,41 @@
-use crate::{Action, plan_sync, sync};
+use crate::{Action, native_sources, plan_sync, sync};
 use std::env;
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
 const HOOK_MARKER: &str = "# rai-managed-hook";
+pub(crate) const GIT_HOOK_EVENTS: &[&str] = &[
+    "applypatch-msg",
+    "pre-applypatch",
+    "post-applypatch",
+    "pre-commit",
+    "pre-merge-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+    "pre-rebase",
+    "post-checkout",
+    "post-merge",
+    "pre-push",
+    "pre-receive",
+    "update",
+    "post-receive",
+    "post-update",
+    "push-to-checkout",
+    "pre-auto-gc",
+    "post-rewrite",
+    "sendemail-validate",
+    "fsmonitor-watchman",
+    "p4-changelist",
+    "p4-prepare-changelist",
+    "p4-post-changelist",
+    "p4-pre-submit",
+    "reference-transaction",
+    "proc-receive",
+];
 
 pub enum Diagnostic {
     ConfigUnavailable,
@@ -28,18 +56,39 @@ pub fn can_run_setup() -> bool {
         })
 }
 
-pub fn setup(mut roots: Vec<PathBuf>) -> Result<(), String> {
+pub fn ensure_first_setup(root: &Path) -> Result<(), String> {
+    if !can_run_setup() {
+        eprintln!(
+            "rai: install rai with `cargo install --path .` to enable automatic machine setup"
+        );
+        return Ok(());
+    }
+    println!("Configuring rai on this machine for {}", root.display());
+    if crate::git_root(root).is_some() {
+        setup(Vec::new())
+    } else {
+        setup(vec![root.to_path_buf()])
+    }
+}
+
+pub fn setup(roots: Vec<PathBuf>) -> Result<(), String> {
     if roots.is_empty() {
-        print!("Workspace directory to watch: ");
-        io::stdout().flush().map_err(|e| e.to_string())?;
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
+        let executable = env::current_exe()
+            .map_err(|e| e.to_string())?
+            .canonicalize()
             .map_err(|e| e.to_string())?;
-        if input.trim().is_empty() {
-            return Err("provide a workspace directory with --root PATH".into());
+        if executable
+            .components()
+            .any(|part| part.as_os_str() == "target")
+        {
+            return Err(
+                "install rai first with `cargo install --path .`, then run `rai install`".into(),
+            );
         }
-        roots.push(PathBuf::from(input.trim()));
+        let config = config_dir()?;
+        fs::create_dir_all(&config).map_err(|e| e.to_string())?;
+        install_global_hooks(&config, &executable)?;
+        return Ok(());
     }
     let executable = env::current_exe()
         .map_err(|e| e.to_string())?
@@ -77,6 +126,15 @@ pub fn setup(mut roots: Vec<PathBuf>) -> Result<(), String> {
         }
     }
     saved.sort();
+    for root in &saved {
+        if let Some(repo) = discover_unmigrated(root, 5)?.into_iter().next() {
+            return Err(format!(
+                "existing harness configuration in {}; run `rai migrate --repo {}` before install",
+                repo.display(),
+                repo.display()
+            ));
+        }
+    }
     write_roots(&config, &saved)?;
     crate::root_tracking::remember(&config, &saved)?;
     println!(
@@ -85,8 +143,33 @@ pub fn setup(mut roots: Vec<PathBuf>) -> Result<(), String> {
         if saved.len() == 1 { "y" } else { "ies" }
     );
     install_hook_template(&config, &executable)?;
+    install_global_hooks(&config, &executable)?;
     install_watcher(&config, &executable)?;
     Ok(())
+}
+
+fn discover_unmigrated(root: &Path, depth: usize) -> Result<Vec<PathBuf>, String> {
+    if depth == 0 || !root.is_dir() || root.is_symlink() {
+        return Ok(Vec::new());
+    }
+    if root.join(".git").exists() {
+        return if root.join(".agents").exists() || native_sources(root)?.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![root.to_path_buf()])
+        };
+    }
+    let mut found = Vec::new();
+    for entry in fs::read_dir(root).map_err(|e| format!("{}: {e}", root.display()))? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || matches!(name.as_ref(), "node_modules" | "target" | "vendor") {
+            continue;
+        }
+        found.extend(discover_unmigrated(&entry.path(), depth - 1)?);
+    }
+    Ok(found)
 }
 
 pub fn watch(perf: bool) -> Result<(), String> {
@@ -134,7 +217,7 @@ pub fn change_workspace(old: &Path, replacement: Option<&Path>) -> Result<(), St
 
 fn watch_once(roots: &[PathBuf]) {
     for root in roots {
-        for repo in discover(root, 5) {
+        for repo in discover(root) {
             if let Err(error) = plan_sync(&repo).and_then(|changes| {
                 if changes
                     .iter()
@@ -151,28 +234,26 @@ fn watch_once(roots: &[PathBuf]) {
     }
 }
 
-fn discover(root: &Path, depth: usize) -> Vec<PathBuf> {
-    if depth == 0 || !root.is_dir() || root.is_symlink() {
-        return Vec::new();
-    }
-    if root.join(".agents").is_dir() {
-        return vec![root.to_path_buf()];
-    }
-    if root.join(".git").exists() {
-        return Vec::new();
-    }
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
+fn discover(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') || matches!(name.as_ref(), "node_modules" | "target" | "vendor") {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        if directory.is_symlink() || !directory.is_dir() {
             continue;
         }
-        found.extend(discover(&path, depth - 1));
+        if directory.join(".agents").is_dir() {
+            found.push(directory);
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&directory) {
+            pending.extend(entries.flatten().filter_map(|entry| {
+                entry
+                    .file_type()
+                    .ok()
+                    .filter(|kind| kind.is_dir())
+                    .map(|_| entry.path())
+            }));
+        }
     }
     found
 }
@@ -223,6 +304,82 @@ fn git_global(name: &str) -> Result<Option<String>, String> {
     }
 }
 
+fn install_global_hooks(config: &Path, executable: &Path) -> Result<(), String> {
+    let hooks = config.join("global-hooks");
+    let previous_path = config.join("global-hooks-previous.json");
+    if hooks.is_symlink() || previous_path.is_symlink() {
+        return Err("symlink global hook configuration conflict".into());
+    }
+    let current = git_global("core.hooksPath")?;
+    let previous: Option<String> = if previous_path.exists() {
+        if current.as_deref() != hooks.to_str() {
+            return Err("global core.hooksPath changed since RosettAI installation".into());
+        }
+        serde_json::from_slice(&fs::read(&previous_path).map_err(|e| e.to_string())?)
+            .map_err(|e| format!("{}: {e}", previous_path.display()))?
+    } else {
+        if current.as_deref() == hooks.to_str() {
+            return Err("global hooksPath points to RosettAI without an ownership record".into());
+        }
+        current.clone()
+    };
+    fs::create_dir_all(&hooks).map_err(|e| e.to_string())?;
+    for event in GIT_HOOK_EVENTS {
+        let path = hooks.join(event);
+        if path.is_symlink()
+            || (path.exists()
+                && !fs::read_to_string(&path)
+                    .map_err(|e| e.to_string())?
+                    .starts_with(&format!("#!/bin/sh\n{HOOK_MARKER}\n")))
+        {
+            return Err(format!("unowned global hook conflict: {}", path.display()));
+        }
+        let delegate = if let Some(old) = &previous {
+            let old_hook = shell_quote(&format!("{old}/{event}"));
+            format!("if [ -x {old_hook} ]; then {old_hook} \"$@\"; fi\n")
+        } else {
+            format!(
+                "git_dir=$(git rev-parse --git-common-dir 2>/dev/null)\nif [ -n \"$git_dir\" ] && [ -x \"$git_dir/hooks/{event}\" ]; then\n  if ! head -n 2 \"$git_dir/hooks/{event}\" | grep -q '{HOOK_MARKER}'; then\n    \"$git_dir/hooks/{event}\" \"$@\"\n  fi\nfi\n"
+            )
+        };
+        let sync = if matches!(*event, "post-checkout" | "post-merge" | "post-rewrite") {
+            format!(
+                "if [ -d .agents ]; then\n  {} sync --git-hook --repo . >/dev/null || printf '%s\\n' 'rai sync failed; run rai doctor' >&2\nfi\n",
+                shell_quote(&executable.to_string_lossy())
+            )
+        } else {
+            String::new()
+        };
+        let content = format!("#!/bin/sh\n{HOOK_MARKER}\n{sync}{delegate}");
+        fs::write(&path, content).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if !previous_path.exists() {
+        fs::write(
+            &previous_path,
+            serde_json::to_vec(&previous).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    if current.as_deref() != hooks.to_str() {
+        let status = Command::new("git")
+            .args(["config", "--global", "core.hooksPath"])
+            .arg(&hooks)
+            .status()
+            .map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err("could not configure global core.hooksPath".into());
+        }
+    }
+    println!("Git hooks: active for all repositories");
+    Ok(())
+}
+
 fn install_hook_template(config: &Path, executable: &Path) -> Result<(), String> {
     if git_global("core.hooksPath")?.is_some() {
         println!(
@@ -261,7 +418,7 @@ fn install_hook_template(config: &Path, executable: &Path) -> Result<(), String>
             return Err(format!("unowned Git hook conflict: {}", path.display()));
         }
         let content = format!(
-            "#!/bin/sh\n{HOOK_MARKER}\nif [ -d .agents ]; then\n  {quoted} sync --repo . >/dev/null || printf '%s\\n' 'rai sync failed; run rai doctor' >&2\nfi\nexit 0\n"
+            "#!/bin/sh\n{HOOK_MARKER}\nif [ -d .agents ]; then\n  {quoted} sync --git-hook --repo . >/dev/null || printf '%s\\n' 'rai sync failed; run rai doctor' >&2\nfi\nexit 0\n"
         );
         fs::write(&path, content).map_err(|e| format!("{}: {e}", path.display()))?;
         #[cfg(unix)]
@@ -448,8 +605,14 @@ pub fn diagnostics() -> Vec<Diagnostic> {
     let Ok(roots) = read_roots(&config) else {
         return vec![Diagnostic::ConfigUnreadable];
     };
-    if roots.is_empty() && !config.join("roots.txt").exists() {
-        return vec![Diagnostic::NoRoots];
+    if roots.is_empty() {
+        return if git_global("core.hooksPath").ok().flatten().as_deref()
+            == config.join("global-hooks").to_str()
+        {
+            Vec::new()
+        } else {
+            vec![Diagnostic::NoRoots]
+        };
     }
     let mut issues = Vec::new();
     let Ok((_, missing)) = crate::root_tracking::resolve(&config, &roots) else {
@@ -494,11 +657,23 @@ mod tests {
         let repo = dir.path().join("projects/example");
         fs::create_dir_all(repo.join(".agents/rules")).unwrap();
         fs::write(repo.join(".agents/rules/general.md"), "Rule\n").unwrap();
-        assert_eq!(discover(dir.path(), 4), vec![repo.clone()]);
+        assert_eq!(discover(dir.path()), vec![repo.clone()]);
         assert_eq!(
             crate::find_repo(&repo).unwrap(),
             repo.canonicalize().unwrap()
         );
+    }
+
+    #[test]
+    fn discovers_deep_projects_inside_git_and_stops_at_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        fs::create_dir_all(outer.join(".git")).unwrap();
+        let nested = outer.join("one/two/three/four/five/project");
+        fs::create_dir_all(nested.join(".agents")).unwrap();
+        let ignored = nested.join("child");
+        fs::create_dir_all(ignored.join(".agents")).unwrap();
+        assert_eq!(discover(dir.path()), vec![nested]);
     }
 
     #[test]

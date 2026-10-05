@@ -74,11 +74,11 @@ pub fn resolve_with_search(
                 .as_ref()
                 .is_none_or(|id| identity(root).as_ref() == Some(id))
         {
-            if expected.is_none() {
-                if let Some(id) = identity(root) {
-                    identities.insert(key, id);
-                    changed = true;
-                }
+            if expected.is_none()
+                && let Some(id) = identity(root)
+            {
+                identities.insert(key, id);
+                changed = true;
             }
             resolved.push(root.clone());
             continue;

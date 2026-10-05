@@ -1,6 +1,5 @@
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 pub fn outputs(
@@ -54,16 +53,12 @@ pub fn outputs(
 }
 
 fn mcp_output(root: &Path) -> Result<Option<String>, String> {
-    let path = root.join(".agents/mcp.json");
-    if !path.exists() {
+    let Some(canonical) = crate::codex::read_mcp(root)? else {
         return Ok(None);
-    }
-    let source = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let canonical: Value =
-        serde_json::from_str(&source).map_err(|e| format!("{}: {e}", path.display()))?;
+    };
     let servers = canonical["servers"]
         .as_object()
-        .ok_or(".agents/mcp.json servers must be an object")?;
+        .ok_or("MCP servers must be an object")?;
     let mut projected = Map::new();
     for (name, value) in servers {
         let server = value.as_object().ok_or("MCP server must be an object")?;

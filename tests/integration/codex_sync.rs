@@ -127,8 +127,8 @@ fn full_codex_projection_and_idempotence() {
     )
     .unwrap();
     fs::write(
-        repo.path().join(".agents/mcp.json"),
-        r#"{"servers":{"docs":{"transport":"http","url":"https://example.invalid/mcp","bearer_token_env_var":"DOCS_TOKEN"},"local":{"transport":"stdio","command":"npx","args":["-y","example"],"cwd":"tools","env_vars":["LOCAL_TOKEN"],"default_tools_approval_mode":"writes"}}}"#,
+        repo.path().join(".agents/mcp.yaml"),
+        "servers:\n  docs:\n    transport: http\n    url: https://example.invalid/mcp\n    bearer_token_env_var: DOCS_TOKEN\n  local:\n    transport: stdio\n    command: npx\n    args: [-y, example]\n    cwd: tools\n    env_vars: [LOCAL_TOKEN]\n    default_tools_approval_mode: writes\n",
     )
     .unwrap();
 
@@ -281,8 +281,8 @@ fn collisions_fail_before_any_projection_is_written() {
         fs::write(&output, "User-owned content\n").unwrap();
         failed(
             repo.path(),
-            &["sync"],
-            "unowned or modified output conflict",
+            &["sync", "--git-hook"],
+            "unmanaged native configuration",
         );
         assert_eq!(fs::read_to_string(&output).unwrap(), "User-owned content\n");
         assert!(!repo.path().join(".gitignore").exists());
@@ -303,19 +303,29 @@ fn invalid_canonical_resources_fail_without_partial_writes() {
             "scoped rule target",
         ),
         (
-            ".agents/mcp.json",
-            r#"{"servers":{"x":{"transport":"http","url":"https://example.invalid","secret":"inline"}}}"#,
+            ".agents/mcp.yaml",
+            "servers:\n  x:\n    transport: http\n    url: https://example.invalid\n    secret: inline\n",
             "unsupported MCP field",
         ),
         (
-            ".agents/subagents/other.yaml",
-            "name: wrong\ndescription: Agent\ndeveloper_instructions: Work\n",
+            ".agents/subagents/other.md",
+            "---\nname: wrong\ndescription: Agent\n---\n\nWork\n",
             "subagent name must match filename",
+        ),
+        (
+            ".agents/subagents/other.md",
+            "name: other\ndescription: Agent\n\nWork\n",
+            "invalid subagent frontmatter",
+        ),
+        (
+            ".agents/subagents/other.md",
+            "---\nname: other\ndescription: Agent\n---\n",
+            "needs a Markdown body",
         ),
         (
             ".agents/subagents/other.json",
             r#"{"name":"other","description":"Agent","developer_instructions":"Work"}"#,
-            "only regular .yaml subagents",
+            "only regular .md or .yaml subagents",
         ),
         (
             ".agents/skills/bad/SKILL.md",
@@ -382,7 +392,11 @@ fn tracked_native_output_is_never_overwritten() {
         .output()
         .unwrap();
     assert!(add.status.success());
-    failed(repo.path(), &["sync"], "tracked output conflict: AGENTS.md");
+    failed(
+        repo.path(),
+        &["sync", "--git-hook"],
+        "unmanaged native configuration: AGENTS.md",
+    );
     assert_eq!(
         fs::read_to_string(repo.path().join("AGENTS.md")).unwrap(),
         "Tracked user guidance.\n"
@@ -404,8 +418,8 @@ fn modified_owned_output_is_preserved() {
     .unwrap();
     failed(
         repo.path(),
-        &["sync"],
-        "unowned or modified output conflict",
+        &["sync", "--git-hook"],
+        "unmanaged native configuration",
     );
     assert_eq!(fs::read_to_string(path).unwrap(), edited);
 }

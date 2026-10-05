@@ -2,5 +2,14 @@
 /target/
 # RosettAI generated files
 /AGENTS.md
+/src/AGENTS.md
 /.codex/config.toml
+/.github/copilot-instructions.md
+/.github/instructions/src.instructions.md
+/CLAUDE.md
+/.claude/rules/src.md
+/.claude/skills/integrate-harness/SKILL.md
+/.claude/skills/release-cli/SKILL.md
+/.claude/skills/rosettai-file-rules/SKILL.md
+/.claude/skills/test-rosettai/SKILL.md
 # End RosettAI generated files
