@@ -91,7 +91,22 @@ fn recursive_migration_preserves_scopes_and_rolls_back_every_original() {
     let case = Case::new(Some("nested-native"));
     let result = case.run(&["sync"], "y\ny\n");
     assert!(result.status.success(), "{}", stderr(&result));
-    assert!(stdout(&result).contains("src/AGENTS.md"));
+    let output = stdout(&result);
+    let discovered = output
+        .split("Discovered unmigrated harness configuration in")
+        .nth(1)
+        .unwrap()
+        .split("Migration proposed")
+        .next()
+        .unwrap();
+    for source in [
+        "AGENTS.md",
+        "src/AGENTS.md",
+        "src/CLAUDE.md",
+        "src/deep/AGENTS.md",
+    ] {
+        assert!(discovered.contains(&format!("  {source}\n")));
+    }
     let global = case.read("AGENTS.md");
     assert!(global.contains("Global repository instructions."));
     assert!(!global.contains("Source directory instructions."));
@@ -497,6 +512,14 @@ fn invalid_rule_metadata_fails_before_any_projection_is_written() {
 #[test]
 fn unsupported_rule_name_is_reported_without_changing_existing_projections() {
     let case = Case::new(Some("invalid-rule-name"));
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&case.repo)
+            .status()
+            .unwrap()
+            .success()
+    );
     let original = case.read(".agents/rules/repository.md");
     fs::write(
         case.repo.join(".agents/rules/repository.md"),
@@ -801,6 +824,7 @@ fn unsupported_native_sources_block_before_writing() {
     let result = unsupported.run(&["sync"], "y\n");
     assert!(!result.status.success());
     assert!(stderr(&result).contains(".codex/config.toml"));
+    assert!(stdout(&result).contains("  .codex/config.toml\n"));
     assert!(!unsupported.repo.join(".agents").exists());
 }
 
@@ -849,7 +873,20 @@ fn tracked_native_source_migrates_and_projects_after_approval() {
     assert!(!tracked.repo.join(".agents").exists());
     let approved = tracked.run(&["sync"], "y\ny\n");
     assert!(approved.status.success(), "{}", stderr(&approved));
-    assert!(stdout(&approved).contains("Copy tracked AGENTS.md"));
+    let preview = stdout(&declined);
+    let discovered = preview
+        .find("Discovered unmigrated harness configuration in")
+        .unwrap();
+    let source = preview.find("  AGENTS.md\n").unwrap();
+    let proposed = preview.find("Migration proposed").unwrap();
+    assert!(discovered < source && source < proposed);
+    assert!(preview.contains(
+        "Copy instructions from AGENTS.md -> .agents/rules/migrated-harness.md (scope: repository)"
+    ));
+    assert!(preview.contains("Remove AGENTS.md from Git before generating its projection"));
+    assert!(preview.contains("Rollback this migration with `rai rollback`"));
+    assert!(!preview.contains("manifest.json"));
+    assert!(!preview.contains(&tracked.backup().display().to_string()));
     assert!(
         tracked
             .read("AGENTS.md")
@@ -1246,4 +1283,96 @@ fn commands_are_reported_as_unsupported_without_being_silently_ignored() {
     assert!(stderr(&result).contains(".agents/commands/review.md"));
     assert_eq!(case.read(".agents/commands/review.md"), content);
     assert!(!case.repo.join("AGENTS.md").exists());
+}
+
+#[test]
+fn migration_previews_gitignore_and_rollback_restores_it() {
+    for existing in [None, Some("/user-cache/\n")] {
+        let case = Case::new(Some("native"));
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&case.repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        if let Some(content) = existing {
+            fs::write(case.repo.join(".gitignore"), content).unwrap();
+        }
+        for name in ["integrate-harness", "release-cli"] {
+            let skill = case.repo.join(format!(".agents/skills/{name}"));
+            fs::create_dir_all(&skill).unwrap();
+            fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Test skill\n---\nInstructions.\n"),
+            )
+            .unwrap();
+        }
+        let declined = case.run(&["migrate"], "n\n");
+        assert!(declined.status.success(), "{}", stderr(&declined));
+        let preview = stdout(&declined);
+        let discovery = preview
+            .find(if existing.is_some() {
+                "Discovered outdated .gitignore"
+            } else {
+                "Discovered missing .gitignore"
+            })
+            .unwrap();
+        let proposed = preview.find("Migration proposed").unwrap();
+        let change = preview
+            .find(if existing.is_some() {
+                "Update .gitignore"
+            } else {
+                "Create .gitignore"
+            })
+            .unwrap();
+        let confirmation = preview.find("Proceed with migration?").unwrap();
+        assert!(discovery < proposed && proposed < change && change < confirmation);
+        assert!(preview.contains("Add /AGENTS.md"));
+        assert_eq!(preview.matches("    Add /.claude\n").count(), 1);
+        assert!(!preview.contains("    Add /.claude/"));
+        assert_eq!(preview.matches("    Add /.github\n").count(), 1);
+        assert!(!preview.contains("    Add /.github/"));
+        assert_eq!(preview.matches("    Add /.codex\n").count(), 1);
+        assert!(!preview.contains("    Add /.codex/"));
+        assert_eq!(
+            fs::read_to_string(case.repo.join(".gitignore"))
+                .ok()
+                .as_deref(),
+            existing
+        );
+        let approved = case.run(&["migrate"], "y\n");
+        assert!(approved.status.success(), "{}", stderr(&approved));
+        assert!(case.read(".gitignore").contains("/AGENTS.md"));
+        if let Some(content) = existing {
+            assert!(case.read(".gitignore").starts_with(content));
+        }
+        let sync = case.run(&["sync"], "");
+        assert!(sync.status.success(), "{}", stderr(&sync));
+        let rollback = case.run(&["rollback"], "");
+        assert!(rollback.status.success(), "{}", stderr(&rollback));
+        assert_eq!(
+            fs::read_to_string(case.repo.join(".gitignore"))
+                .ok()
+                .as_deref(),
+            existing
+        );
+    }
+}
+
+#[test]
+fn non_git_migration_and_sync_do_not_create_gitignore() {
+    let case = Case::new(Some("native"));
+    let migration = case.run(&["migrate"], "y\n");
+    assert!(migration.status.success(), "{}", stderr(&migration));
+    assert!(!stdout(&migration).contains(".gitignore"));
+    assert!(!case.repo.join(".gitignore").exists());
+    let sync = case.run(&["sync"], "");
+    assert!(sync.status.success(), "{}", stderr(&sync));
+    assert!(!case.repo.join(".gitignore").exists());
+    fs::write(case.repo.join(".gitignore"), "/user-cache/\n").unwrap();
+    let repeated = case.run(&["sync"], "");
+    assert!(repeated.status.success(), "{}", stderr(&repeated));
+    assert_eq!(case.read(".gitignore"), "/user-cache/\n");
 }

@@ -487,9 +487,10 @@ fn print_codex_hook_result(message: &str) {
     );
 }
 
-fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
-    let rules = read_rules(root)?;
-    codex::check_version()?;
+fn projection_outputs(
+    root: &Path,
+    rules: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<(String, String, String)>, String> {
     let mut outputs = rules
         .iter()
         .map(|(scope, sections)| {
@@ -505,7 +506,7 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
     for (path, body) in codex::outputs(root)? {
         outputs.push((path, owned_comment(&body), "hash".to_string()));
     }
-    for (path, body, kind) in copilot::outputs(root, &rules)? {
+    for (path, body, kind) in copilot::outputs(root, rules)? {
         let content = if kind == "jsonc" {
             owned_slash_comment(&body)
         } else {
@@ -513,7 +514,7 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         };
         outputs.push((path, content, kind));
     }
-    for (path, body, kind) in claude::outputs(root, &rules)? {
+    for (path, body, kind) in claude::outputs(root, rules)? {
         let content = if kind == "json" {
             owned_json(&body)?
         } else {
@@ -521,6 +522,14 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         };
         outputs.push((path, content, kind));
     }
+
+    Ok(outputs)
+}
+
+fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
+    let rules = read_rules(root)?;
+    codex::check_version()?;
+    let outputs = projection_outputs(root, &rules)?;
 
     // Plan every write before applying any of them. A single collision aborts the sync.
     let mut changes = Vec::new();
@@ -715,6 +724,10 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
             });
         }
     }
+    if git_root(root).is_none() {
+        return Ok(changes);
+    }
+
     let paths = changes
         .iter()
         .filter(|change| change.action != Action::Delete)
@@ -1285,6 +1298,14 @@ fn migrate(start: &Path) -> Result<(), String> {
     if found.is_empty() {
         return Err("no unmanaged harness configuration found to migrate".into());
     }
+    println!(
+        "Discovered unmigrated harness configuration in {}:",
+        root.display()
+    );
+    for relative in &found {
+        println!("  {relative}");
+    }
+    println!();
     let unsupported = found
         .iter()
         .filter(|path| instruction_scope(path).is_err())
@@ -1376,32 +1397,94 @@ fn migrate(start: &Path) -> Result<(), String> {
         parse_rule(body)?;
         rules.push(serde_json::json!({"path": relative, "scope": scope, "name": original_name, "sha256": sha256_hex(body.as_bytes())}));
     }
-    println!("Migration proposed for {}:", root.display());
-    for relative in &found {
-        if tracked.contains(&relative.as_str()) {
-            println!(
-                "  Copy tracked {relative} -> {}/{relative}; remove it from Git before generating its projection",
-                backup.display()
-            );
+    let ignore_change = if git_root(&root).is_some() {
+        let mut projected_rules = if agents.join("rules").is_dir() {
+            read_rules(&root)?
         } else {
-            println!("  Move {relative} -> {}/{relative}", backup.display());
+            BTreeMap::new()
+        };
+        for (scope, body) in &generated {
+            projected_rules
+                .entry(scope.clone())
+                .or_default()
+                .push(body.clone());
         }
-    }
-    for rule in &rules {
+        let path = root.join(".gitignore");
+        if path.is_symlink() {
+            return Err("symlink output conflict: .gitignore".into());
+        }
+        let old = if path.exists() {
+            Some(fs::read_to_string(&path).map_err(|e| format!(".gitignore: {e}"))?)
+        } else {
+            None
+        };
+        let mut paths = projection_outputs(&root, &projected_rules)?
+            .into_iter()
+            .map(|(path, _, _)| path)
+            .collect::<Vec<_>>();
+        paths.extend(managed_output_paths(old.as_deref().unwrap_or(""))?);
+        let mut seen = std::collections::HashSet::new();
+        paths.retain(|path| seen.insert(path.clone()));
+        let new = update_ignore_paths(old.as_deref().unwrap_or(""), &paths)?;
+        if old.as_deref() == Some(&new) {
+            None
+        } else {
+            Some((old, new))
+        }
+    } else {
+        None
+    };
+    if let Some((old, _)) = &ignore_change {
         println!(
-            "  Create {} from these instructions (scope: {})",
-            rule["path"].as_str().unwrap(),
-            if rule["scope"] == "" {
-                "repository"
-            } else {
-                rule["scope"].as_str().unwrap()
-            }
+            "Discovered {} .gitignore: generated projections need ignore entries.",
+            if old.is_some() { "outdated" } else { "missing" }
         );
     }
-    println!(
-        "  Record {}/manifest.json for `rai rollback`",
-        backup.display()
-    );
+    println!("Migration proposed for {}:", root.display());
+    for relative in &found {
+        let scope = instruction_scope(relative)?;
+        let rule = rules
+            .iter()
+            .find(|rule| rule["scope"].as_str() == Some(scope.as_str()))
+            .ok_or("missing migration destination for source")?;
+        println!(
+            "  Copy instructions from {relative} -> {} (scope: {})",
+            rule["path"].as_str().unwrap(),
+            if scope.is_empty() {
+                "repository"
+            } else {
+                &scope
+            }
+        );
+        if tracked.contains(&relative.as_str()) {
+            println!("  Remove {relative} from Git before generating its projection");
+        }
+    }
+    if let Some((old, new)) = &ignore_change {
+        println!(
+            "  {} .gitignore: ignore generated harness projections",
+            if old.is_some() { "Update" } else { "Create" }
+        );
+        let old_entries = old.as_deref().unwrap_or("");
+        let mut displayed = std::collections::HashSet::new();
+        for entry in new
+            .lines()
+            .filter(|line| line.starts_with('/') && !old_entries.lines().any(|old| old == *line))
+        {
+            let entry = ["/.claude", "/.github", "/.codex", "/.vscode", "/.cursor"]
+                .into_iter()
+                .find(|root| {
+                    entry
+                        .strip_prefix(root)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+                })
+                .unwrap_or(entry);
+            if displayed.insert(entry) {
+                println!("    Add {entry}");
+            }
+        }
+    }
+    println!("  Rollback this migration with `rai rollback`");
     print!("Proceed with migration? [y/N] ");
     io::stdout().flush().map_err(|e| e.to_string())?;
     let mut answer = String::new();
@@ -1421,6 +1504,17 @@ fn migrate(start: &Path) -> Result<(), String> {
             ));
         }
     }
+    if let Some((old, _)) = &ignore_change {
+        let path = root.join(".gitignore");
+        let current = if path.exists() {
+            Some(fs::read_to_string(&path).map_err(|e| format!(".gitignore: {e}"))?)
+        } else {
+            None
+        };
+        if path.is_symlink() || &current != old {
+            return Err(".gitignore changed during confirmation".into());
+        }
+    }
     let legacy = rules.len() == 1
         && rules[0]["path"] == ".agents/rules/migrated-harness.md"
         && rules[0]["scope"] == "";
@@ -1430,6 +1524,9 @@ fn migrate(start: &Path) -> Result<(), String> {
         "createdAgents": !agents.exists(),
         "sources": sources,
     });
+    if let Some((old, new)) = &ignore_change {
+        manifest["gitignore"] = serde_json::json!({"before": old, "after": new});
+    }
     if legacy {
         manifest["generated"] = serde_json::json!(".agents/rules/migrated-harness.md");
         manifest["generatedSha256"] = rules[0]["sha256"].clone();
@@ -1461,6 +1558,9 @@ fn migrate(start: &Path) -> Result<(), String> {
         if !tracked.contains(&relative.as_str()) {
             fs::remove_file(root.join(relative)).map_err(|e| format!("{relative}: {e}"))?;
         }
+    }
+    if let Some((_, new)) = &ignore_change {
+        fs::write(root.join(".gitignore"), new).map_err(|e| format!(".gitignore: {e}"))?;
     }
     println!(
         "Migrated {} native instruction file(s) into {} canonical rule(s)",
@@ -1506,6 +1606,17 @@ fn rollback_migration(start: &Path) -> Result<(), String> {
     let sources = manifest["sources"]
         .as_array()
         .ok_or("invalid migration manifest sources")?;
+    let restore_ignore = manifest
+        .get("gitignore")
+        .filter(|_| git_root(&root).is_some());
+    if let Some(ignore) = restore_ignore {
+        let path = root.join(".gitignore");
+        if path.is_symlink()
+            || fs::read_to_string(&path).ok().as_deref() != ignore["after"].as_str()
+        {
+            return Err("rollback conflict: .gitignore changed since migration".into());
+        }
+    }
     for source in sources {
         let relative = source["path"].as_str().ok_or("invalid migration source")?;
         instruction_scope(relative)?;
@@ -1559,6 +1670,14 @@ fn rollback_migration(start: &Path) -> Result<(), String> {
     }
     for rule in &rules {
         fs::remove_file(root.join(&rule.path)).map_err(|e| e.to_string())?;
+    }
+    if let Some(ignore) = restore_ignore {
+        let path = root.join(".gitignore");
+        if let Some(before) = ignore["before"].as_str() {
+            fs::write(path, before).map_err(|e| e.to_string())?;
+        } else {
+            fs::remove_file(path).map_err(|e| e.to_string())?;
+        }
     }
     println!(
         "Restored {} original instruction file(s); backup retained at {}",
@@ -2281,6 +2400,14 @@ mod tests {
 
     fn repo() -> TempDir {
         let dir = tempfile::tempdir().unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         fs::create_dir_all(dir.path().join(".agents/rules")).unwrap();
         fs::write(
             dir.path().join(".agents/rules/general.md"),

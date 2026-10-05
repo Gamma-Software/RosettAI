@@ -10,3 +10,5 @@ path: .
 - The Rust CLI supports `rai setup`, `init`, `status`, `sync`, and `doctor`. It projects global and directory-scoped Markdown rules, MCP servers, and custom agents to Codex. Native-file migration and other harnesses are not implemented.
 - Before changing synchronization behavior, run `cargo test` and add tests for idempotence, ownership conflicts, and scope preservation as relevant. Run `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and `git diff --check` before submitting.
 - Preserve user-maintained native configuration. A generated file may be replaced only when its ownership marker and content digest are valid; Git-tracked native outputs are conflicts.
+
+- In migration previews of `.gitignore` changes, summarize generated harness paths by their configuration root (`/.claude`, `/.github`, `/.codex`, `/.vscode`, `/.cursor`), once per root, instead of listing every generated file. Keep standalone instruction files such as `/AGENTS.md` and `/CLAUDE.md` visible. This display convention does not broaden the actual `.gitignore` entries beyond rai-owned generated paths.

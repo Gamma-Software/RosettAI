@@ -7,6 +7,14 @@ use tempfile::TempDir;
 
 fn repo() -> TempDir {
     let repo = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
     fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
     fs::write(
         repo.path().join(".agents/rules/general.md"),
@@ -50,6 +58,9 @@ fn fixture_files(root: &Path) -> Vec<PathBuf> {
     fn visit(root: &Path, current: &Path, files: &mut Vec<PathBuf>) {
         for entry in fs::read_dir(current).unwrap() {
             let path = entry.unwrap().path();
+            if path.file_name().is_some_and(|name| name == ".git") {
+                continue;
+            }
             if path.is_dir() {
                 visit(root, &path, files);
             } else {
@@ -76,6 +87,14 @@ fn example_project_matches_expected_tree_byte_for_byte() {
     );
     assert!(input.join(".agents").is_dir());
     let repo = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
     for relative in fixture_files(&input) {
         let target = repo.path().join(&relative);
         fs::create_dir_all(target.parent().unwrap()).unwrap();

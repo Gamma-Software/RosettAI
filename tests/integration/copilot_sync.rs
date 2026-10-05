@@ -7,6 +7,14 @@ use tempfile::TempDir;
 
 fn repo() -> TempDir {
     let repo = tempfile::tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success()
+    );
     fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
     fs::write(
         repo.path().join(".agents/rules/general.md"),
