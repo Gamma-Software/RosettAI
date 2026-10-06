@@ -45,6 +45,16 @@ Every manual `rai sync` checks for unmanaged root and nested instructions and na
 
 `rai sync` validates canonical sources and destinations before writing; it does not run the interactive `rai doctor` workflow. RosettAI adds only specific generated paths to a marked block in the repository-root `.gitignore` when the project is a Git repository; this may leave a reviewable Git change until the block is committed. An unowned file that is not a supported migration source is reported as a conflict and is never overwritten.
 
+`rai doctor` groups terminal diagnostics into Project, Synchronization, and Installation.
+It displays green checks for passing groups, red errors for invalid resources or
+unsafe projections, and yellow warnings for drift or incomplete installation.
+Synchronization is shown as unchecked when project validation fails. The summary
+counts errors and warnings; unresolved issues still produce a failing exit status.
+Enter an issue number to apply its available fix, `a` to apply all available fixes,
+`r` to rerun diagnostics, or `q` to exit (then press Enter). Corrections are followed
+by another check. Missing workspace locations retain their separate choice prompt.
+Non-interactive runs never prompt, and `--json` keeps its existing output schema.
+
 ## What runs automatically
 
 The optional per-user watcher polls configured workspace directories and searches all subdirectories. It stops descending once it finds `.agents/` and does not follow symbolic links. `rai install` can install a Git hook integration on the developer's machine before a clone. The `post-checkout` hook runs after the initial checkout of a normal clone, branch switch, or worktree creation. It checks for `.agents/` and calls the same sync operation used by the CLI. `post-merge` and `post-rewrite` cover merge-based pulls and rebases. The hook reports sync failures without making a successfully cloned repository appear to have failed.

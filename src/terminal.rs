@@ -1,5 +1,4 @@
-//! Reusable terminal rendering, reserved for future CLI integration.
-//! Not declared in main.rs yet, so this module does not affect CLI output.
+//! Reusable terminal rendering for CLI help and diagnostic progress.
 //! Spinner callers should call tick roughly every FRAME_INTERVAL.
 use std::io::{self, Write};
 use std::time::{Duration, Instant};

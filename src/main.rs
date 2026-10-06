@@ -14,6 +14,7 @@ mod hook_registry;
 mod perf;
 mod root_tracking;
 mod setup;
+mod terminal;
 mod uninstall;
 mod update;
 mod user_data;
@@ -69,6 +70,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if args.is_empty() {
         return helper();
     }
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        return print_help();
+    }
     let mut args = args.into_iter();
     let command = args.next().ok_or_else(usage)?;
     let mut dry_run = false;
@@ -94,8 +98,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         if dry_run || json || codex_hook || git_hook || repo.is_some() || !roots.is_empty() {
             return Err("help accepts only --perf".into());
         }
-        print_help();
-        return Ok(());
+        return print_help();
     }
     if dry_run && command != "sync" {
         return Err("--dry-run is only valid with sync".into());
@@ -257,17 +260,48 @@ fn usage() -> String {
         .into()
 }
 
-fn print_help() {
-    println!(
-        "RosettAI CLI\n\nRun `rai` for the interactive helper.\n\nCommon commands:\n  rai sync               Set up the current project if needed, then synchronize\n  rai doctor             Diagnose and repair configuration problems\n  rai help               Show this help\n\nOther commands:\n  rai init               Create an empty canonical source tree or offer migration\n  rai status             Show projection status\n  rai install            Set up global Git hooks; optionally watch a directory (--root PATH)\n  rai uninstall          Remove machine integration\n  rai migrate            Import supported native instructions\n  rai rollback           Restore instructions from a migration backup\n  rai update             Update the CLI\n\nOptions: --repo PATH, --root PATH, --dry-run, --json, --perf\nRun `rai <command> --repo PATH` to target another project where supported."
-    );
+fn print_help() -> Result<(), String> {
+    let mut out = io::stdout().lock();
+    let color = out.is_terminal();
+    let title = format!("◆ ROSETTAI  ·  {}", env!("CARGO_PKG_VERSION"));
+    let rows = [
+        ("", ""),
+        (title.as_str(), "1"),
+        ("One source of truth for your AI coding agents.", "2"),
+        ("Rules, skills and agent configuration stay in sync.", "2"),
+        ("", ""),
+        (
+            "rai install     Set up machine integration",
+            terminal::ACCENT,
+        ),
+        (
+            "rai sync        Set up and synchronize this project",
+            terminal::ACCENT,
+        ),
+        (
+            "rai doctor      Check setup and fix problems",
+            terminal::ACCENT,
+        ),
+        ("rai update      Update rai", terminal::ACCENT),
+        (
+            "rai uninstall   Stop and remove automatic sync",
+            terminal::ACCENT,
+        ),
+        ("rai help        Show this help", terminal::ACCENT),
+        ("", ""),
+        ("Set up once, then work normally. Sync is automatic.", "2"),
+        ("", ""),
+    ];
+    writeln!(out).map_err(|e| e.to_string())?;
+    terminal::rectangle(&mut out, &rows, color).map_err(|e| e.to_string())?;
+    writeln!(out).map_err(|e| e.to_string())
 }
 
 fn helper() -> Result<(), String> {
     if !io::stdin().is_terminal() {
-        print_help();
-        return Ok(());
+        return print_help();
     }
+    print_help()?;
     let current = env::current_dir().map_err(|e| e.to_string())?;
     loop {
         let root = git_root(&current).unwrap_or_else(|| current.clone());
@@ -304,7 +338,7 @@ fn helper() -> Result<(), String> {
                 doctor(&root, false)?;
             }
             "3" => machine_helper(&current)?,
-            "4" => print_help(),
+            "4" => print_help()?,
             "q" | "Q" => return Ok(()),
             _ => println!("Choose 1–4 or q."),
         }
@@ -1728,7 +1762,16 @@ enum DoctorFix {
     WorkspaceMissing(PathBuf),
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum DoctorArea {
+    Project,
+    Synchronization,
+    Installation,
+}
+
 struct DoctorIssue {
+    area: DoctorArea,
+    warning: bool,
     message: String,
     solution: String,
     fix: Option<DoctorFix>,
@@ -1739,6 +1782,8 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
     let mut changes = Vec::new();
     if !root.join(".agents").exists() {
         issues.push(DoctorIssue {
+            area: DoctorArea::Project,
+            warning: false,
             message: "no .agents/ directory in this repository".into(),
             solution: "Run rai sync to create an empty .agents/ source tree, then add the resources your project needs.".into(),
             fix: Some(DoctorFix::Init),
@@ -1747,6 +1792,8 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
         match plan_sync(root) {
             Ok(planned) => changes = planned,
             Err(error) => issues.push(DoctorIssue {
+                area: DoctorArea::Project,
+                warning: false,
                 solution: solution_for_plan_error(&error),
                 message: error,
                 fix: None,
@@ -1758,6 +1805,8 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
         .any(|change| change.action != Action::Unchanged)
     {
         issues.push(DoctorIssue {
+            area: DoctorArea::Synchronization,
+            warning: true,
             message: "generated projections are out of sync".into(),
             solution:
                 "Run rai sync to update only rai-owned outputs and the managed .gitignore block."
@@ -1771,12 +1820,20 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
             .is_some_and(|s| is_owned(&s, ""))
     {
         issues.push(DoctorIssue {
+            area: DoctorArea::Project,
+            warning: false,
             message: "unmanaged AGENTS.md exists".into(),
             solution: "Run rai migrate to import untracked root instructions, or manually convert tracked native files before sync.".into(),
             fix: None,
         });
     }
     for issue in setup::diagnostics() {
+        let warning = matches!(
+            issue,
+            setup::Diagnostic::NoRoots
+                | setup::Diagnostic::WatcherMissing
+                | setup::Diagnostic::WorkspaceMissing(_)
+        );
         let can_setup = setup::can_run_setup();
         let (message, solution, fix) = match issue {
             setup::Diagnostic::ConfigUnavailable => (
@@ -1810,6 +1867,8 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
             ),
         };
         issues.push(DoctorIssue {
+            area: DoctorArea::Installation,
+            warning,
             message,
             solution,
             fix,
@@ -1843,7 +1902,11 @@ fn doctor(root: &Path, json: bool) -> Result<(), String> {
     let mut passes = 0;
     let mut deferred = HashSet::new();
     loop {
-        let (issues, changes) = inspect_doctor(root);
+        let (issues, changes) = if json || !io::stdout().is_terminal() {
+            inspect_doctor(root)
+        } else {
+            inspect_doctor_with_progress(root)?
+        };
         if json {
             print!("{{\"ok\":{},\"issues\":[", issues.is_empty());
             for (index, issue) in issues.iter().enumerate() {
@@ -1869,8 +1932,9 @@ fn doctor(root: &Path, json: bool) -> Result<(), String> {
                 Err(format!("{} issue(s) found", issues.len()))
             };
         }
+        print_doctor_report(root, &issues)?;
         if issues.is_empty() {
-            println!("No issues found");
+            println!("  No issues found\n");
             return Ok(());
         }
         if io::stdin().is_terminal() {
@@ -1904,17 +1968,6 @@ fn doctor(root: &Path, json: bool) -> Result<(), String> {
                 continue;
             }
         }
-        for (index, issue) in issues.iter().enumerate() {
-            println!("{}. {}", index + 1, issue.message);
-            println!("   Solution: {}", issue.solution);
-            if issue
-                .fix
-                .as_ref()
-                .is_some_and(|fix| !matches!(fix, DoctorFix::WorkspaceMissing(_)))
-            {
-                println!("   Automatic fix available");
-            }
-        }
         let available: Vec<DoctorFix> = issues
             .iter()
             .filter_map(|issue| {
@@ -1924,10 +1977,13 @@ fn doctor(root: &Path, json: bool) -> Result<(), String> {
                     .filter(|fix| !matches!(fix, DoctorFix::WorkspaceMissing(_)))
             })
             .collect();
-        if available.is_empty() {
+        if available.is_empty() && !io::stdin().is_terminal() {
             return Err(format!("{} issue(s) found", issues.len()));
         }
         if fix_all {
+            if available.is_empty() {
+                return Err(format!("{} issue(s) require manual review", issues.len()));
+            }
             passes += 1;
             if passes > 8 {
                 return Err("automatic fixes did not converge".into());
@@ -1941,16 +1997,22 @@ fn doctor(root: &Path, json: bool) -> Result<(), String> {
         if !io::stdin().is_terminal() {
             return Err(format!("{} issue(s) found", issues.len()));
         }
-        print!("Fix which issue? Enter a number, 'all', or 'no': ");
+        if !available.is_empty() {
+            println!("  a  Fix all automatically fixable issues");
+        }
+        println!("  r  Run diagnostics again");
+        println!("  q  Exit");
+        print!("\n  Enter an issue number, a, r or q: ");
         io::stdout().flush().map_err(|e| e.to_string())?;
         let mut input = String::new();
         io::stdin()
             .read_line(&mut input)
             .map_err(|e| e.to_string())?;
         match choose_fixes(&input, &issues) {
+            FixChoice::Recheck => continue,
             FixChoice::Quit => return Err(format!("{} issue(s) found", issues.len())),
             FixChoice::Invalid => {
-                println!("Choose an issue number, 'all', or 'no'.");
+                println!("Choose an issue number, a, r or q.");
                 continue;
             }
             FixChoice::Manual(index) => {
@@ -1973,9 +2035,129 @@ fn doctor(root: &Path, json: bool) -> Result<(), String> {
     }
 }
 
+fn inspect_doctor_with_progress(root: &Path) -> Result<(Vec<DoctorIssue>, Vec<Change>), String> {
+    std::thread::scope(|scope| {
+        let (stop, receiver) = std::sync::mpsc::channel::<()>();
+        let progress = scope.spawn(move || -> io::Result<()> {
+            let mut step = terminal::Step::new("Running diagnostics", true);
+            loop {
+                step.tick(&mut io::stdout().lock())?;
+                if receiver.recv_timeout(terminal::FRAME_INTERVAL)
+                    != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                {
+                    return step.finish(&mut io::stdout().lock(), true);
+                }
+            }
+        });
+        let result = inspect_doctor(root);
+        drop(stop);
+        progress
+            .join()
+            .map_err(|_| "diagnostic display failed".to_string())?
+            .map_err(|e| e.to_string())?;
+        Ok(result)
+    })
+}
+
+fn print_doctor_report(root: &Path, issues: &[DoctorIssue]) -> Result<(), String> {
+    let mut out = io::stdout().lock();
+    let color = out.is_terminal();
+    let render = |out: &mut std::io::StdoutLock<'_>| -> io::Result<()> {
+        writeln!(
+            out,
+            "\n  {}\n",
+            terminal::style(&root.display().to_string(), "2", color)
+        )?;
+        for (area, title, healthy) in [
+            (
+                DoctorArea::Project,
+                "Project",
+                "Canonical resources and projection safety",
+            ),
+            (
+                DoctorArea::Synchronization,
+                "Synchronization",
+                "Generated projections are up to date",
+            ),
+            (
+                DoctorArea::Installation,
+                "Installation",
+                "Workspace roots and watcher service",
+            ),
+        ] {
+            writeln!(out, "  {}", terminal::style(title, "1", color))?;
+            let found: Vec<_> = issues
+                .iter()
+                .enumerate()
+                .filter(|(_, issue)| issue.area == area)
+                .collect();
+            if found.is_empty() {
+                if area == DoctorArea::Synchronization
+                    && issues.iter().any(|issue| issue.area == DoctorArea::Project)
+                {
+                    writeln!(
+                        out,
+                        "    {} Not checked until project issues are resolved",
+                        terminal::style("○", "2", color)
+                    )?;
+                } else {
+                    writeln!(out, "    {} {healthy}", terminal::style("✓", "32", color))?;
+                }
+            }
+            for (index, issue) in found {
+                let (mark, code) = if issue.warning {
+                    ("●", "33")
+                } else {
+                    ("✖", "31")
+                };
+                writeln!(
+                    out,
+                    "    {} {}. {}",
+                    terminal::style(mark, code, color),
+                    index + 1,
+                    issue.message
+                )?;
+                writeln!(
+                    out,
+                    "      Solution: {}",
+                    terminal::style(&issue.solution, "2", color)
+                )?;
+                if issue
+                    .fix
+                    .as_ref()
+                    .is_some_and(|fix| !matches!(fix, DoctorFix::WorkspaceMissing(_)))
+                {
+                    writeln!(
+                        out,
+                        "      {}",
+                        terminal::style("Automatic fix available", terminal::ACCENT, color)
+                    )?;
+                }
+            }
+            writeln!(out)?;
+        }
+        let warnings = issues.iter().filter(|issue| issue.warning).count();
+        writeln!(
+            out,
+            "  {}   {}",
+            terminal::style("Errors:", "1", color),
+            issues.len() - warnings
+        )?;
+        writeln!(
+            out,
+            "  {} {}\n",
+            terminal::style("Warnings:", "1", color),
+            warnings
+        )?;
+        out.flush()
+    };
+    render(&mut out).map_err(|e| e.to_string())
+}
+
 enum FixChoice {
     Apply { fixes: Vec<DoctorFix>, all: bool },
     Manual(usize),
+    Recheck,
     Quit,
     Invalid,
 }
@@ -2030,6 +2212,7 @@ fn choose_fixes(input: &str, issues: &[DoctorIssue]) -> FixChoice {
                 .collect(),
             all: true,
         },
+        "r" => FixChoice::Recheck,
         "no" | "n" | "q" | "quit" | "" => FixChoice::Quit,
         value => match value
             .parse::<usize>()
@@ -2856,16 +3039,22 @@ mod tests {
     fn doctor_selection_supports_one_all_and_manual() {
         let issues = vec![
             DoctorIssue {
+                area: DoctorArea::Project,
+                warning: false,
                 message: "drift".into(),
                 solution: "sync".into(),
                 fix: Some(DoctorFix::Sync),
             },
             DoctorIssue {
+                area: DoctorArea::Project,
+                warning: false,
                 message: "manual".into(),
                 solution: "review".into(),
                 fix: None,
             },
             DoctorIssue {
+                area: DoctorArea::Project,
+                warning: false,
                 message: "setup".into(),
                 solution: "configure".into(),
                 fix: Some(DoctorFix::SetupExisting),
@@ -2879,6 +3068,7 @@ mod tests {
             matches!(choose_fixes("all", &issues), FixChoice::Apply { fixes, all: true } if fixes.len() == 2)
         );
         assert!(matches!(choose_fixes("no", &issues), FixChoice::Quit));
+        assert!(matches!(choose_fixes("r", &issues), FixChoice::Recheck));
         assert!(matches!(choose_fixes("4", &issues), FixChoice::Invalid));
     }
 

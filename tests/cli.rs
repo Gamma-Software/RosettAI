@@ -294,9 +294,9 @@ fn help_and_noninteractive_default_show_english_guidance() {
             .unwrap();
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("Run `rai` for the interactive helper"));
-        assert!(stdout.contains("Set up the current project if needed"));
-        assert!(stdout.contains("rai rollback"));
+        assert!(stdout.contains("ROSETTAI"));
+        assert!(stdout.contains("Set up and synchronize this project"));
+        assert!(stdout.contains("rai sync"));
     }
 }
 
@@ -606,6 +606,34 @@ fn first_init_sets_up_machine_once() {
     assert!(!String::from_utf8_lossy(&second.stdout).contains("Configuring rai"));
 }
 
+#[test]
+fn help_works_without_a_project_and_without_ansi_when_piped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut expected = None;
+    for args in [vec![], vec!["help"], vec!["--help"], vec!["-h"]] {
+        let result = Command::new(env!("CARGO_BIN_EXE_rai"))
+            .args(args)
+            .current_dir(dir.path())
+            .env("XDG_CACHE_HOME", dir.path())
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert!(result.stderr.is_empty());
+        let text = String::from_utf8(result.stdout).unwrap();
+        assert!(text.contains("ROSETTAI"));
+        assert!(text.contains("rai doctor"));
+        assert!(text.contains("rai sync"));
+        assert!(!text.contains("Options"));
+        assert!(text.contains("rai install"));
+        assert!(!text.contains('\u{1b}'));
+        if let Some(expected) = &expected {
+            assert_eq!(&text, expected);
+        } else {
+            expected = Some(text);
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn update_installs_verified_release_archive() {
@@ -901,6 +929,14 @@ fn doctor_json_suggests_init_for_unconfigured_repo() {
         .unwrap();
     let output = String::from_utf8_lossy(&plain.stdout);
     assert!(output.contains("Solution: Run rai sync"));
+    assert!(output.contains("✖ 1. no .agents/ directory"));
+    assert!(output.contains("Not checked until project issues are resolved"));
+    assert!(!output.contains("Generated projections are up to date"));
+    assert!(output.contains("Project"));
+    assert!(output.contains("Installation"));
+    assert!(output.contains("Errors:"));
+    assert!(output.contains("Warnings:"));
+    assert!(!output.contains('\u{1b}'));
     assert!(!output.contains("Fix which issue?"));
 }
 
