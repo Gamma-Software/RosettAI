@@ -4,23 +4,48 @@ Notable changes to the `rai` CLI are recorded here.
 
 ## Unreleased
 
-### Changed
-
-- Store macOS and Linux per-user configuration under `~/.rai/` by default,
-  migrating existing `~/.config/rai/` data and Git template references.
-- Store the default Unix release-check cache under `~/.rai/cache/`.
-
-- Record installed Git template hooks in a per-user JSON file and update it on
-  uninstall.
+## 0.4.0 - 2026-10-08
 
 ### Added
 
+- Sync reports grouped by Codex, Claude Code, GitHub Copilot, and project
+  maintenance, with the verdict and file counters shown first.
+- `rai sync --compact` to hide unchanged file entries while retaining their
+  count, conflicts, comparisons, repair guidance, and backup paths.
+- Content comparisons and per-file repair guidance for synchronization drift
+  and conflicts, including a complete inventory when writes are blocked.
+- External backups of edited active projections with intact ownership markers
+  before regenerating them from canonical sources.
+- Codex and Claude Code edit-tool guards that redirect changes to `.agents/`.
+  These require trusted, enabled hooks and do not intercept arbitrary shell or
+  MCP writes.
+- Per-project and global command transcripts recording output, errors,
+  duration, and exit status, including watcher synchronizations.
+- `rai version`, `--version`, and `-V` with the version and build commit.
+- Suggestions for mistyped public commands, with confirmation before running
+  a suggested command in an interactive terminal.
+- Scoped native instruction migration and rollback, with Git-tracking and
+  `.gitignore` previews, verified backups, and resumable migration.
+- Styled terminal help and grouped doctor diagnostics.
+- Typed canonical resource directories for rules, agents, commands, and skills.
+  Unsupported command projections are reported explicitly.
 - `rai uninstall` to remove the per-user watcher and Git template.
-- Renamed the `rai setup` command to `rai install`.
 - Watcher and `rai doctor` can recover a moved workspace by matching its saved
   filesystem identity near the previous location or in the user's home directory.
   For each unresolved workspace, interactive `rai doctor` asks whether to use a
   new location, stop watching it, or keep it for later.
+
+### Changed
+
+- Rename `rai setup` to `rai install` for machine integration.
+- Remove regular `.keep` placeholders from populated canonical directories
+  during successful synchronization; previews and blocked syncs preserve them.
+- Display complete repository-relative sync paths consistently on all platforms.
+- Store macOS and Linux per-user configuration under `~/.rai/` by default,
+  migrating existing `~/.config/rai/` data and Git template references.
+- Store the default Unix release-check cache under `~/.rai/cache/`.
+- Record installed Git template hooks in a per-user JSON file and update it on
+  uninstall.
 
 ## 0.3.1 - 2026-09-30
 
