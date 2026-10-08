@@ -4,6 +4,15 @@ Notable changes to the `rai` CLI are recorded here.
 
 ## Unreleased
 
+## 0.4.1 - 2026-10-08
+
+### Fixed
+
+- Make Windows workspace recovery tests deterministic when temporary directories
+  share a creation timestamp, and verify that ambiguous matches preserve the saved
+  configuration. The v0.4.0 release workflow stopped before publishing archives;
+  v0.4.1 includes all changes listed below.
+
 ## 0.4.0 - 2026-10-08
 
 ### Added

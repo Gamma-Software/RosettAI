@@ -260,6 +260,23 @@ fn identity(path: &Path) -> Option<String> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    fn set_creation_time(path: &Path) {
+        use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        let directory = fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .unwrap();
+        directory
+            .set_times(fs::FileTimes::new().set_created(UNIX_EPOCH + Duration::from_secs(42)))
+            .unwrap();
+    }
+
     #[test]
     fn updates_a_moved_workspace_and_keeps_unresolved_roots() {
         let dir = tempfile::tempdir().unwrap();
@@ -269,6 +286,9 @@ mod tests {
         let moved = dir.path().join("moved");
         let absent = dir.path().join("absent");
         fs::create_dir(&first).unwrap();
+        // Keep the workspace identity distinct from directories created in the same clock tick.
+        #[cfg(windows)]
+        set_creation_time(&first);
         remember(&config, std::slice::from_ref(&first)).unwrap();
         write_roots(
             &config,
@@ -285,6 +305,41 @@ mod tests {
         assert!(!saved.contains(&first.to_string_lossy().to_string()));
         assert!(saved.contains(&absent.to_string_lossy().to_string()));
         assert!(resolve(&config, &[moved, absent]).unwrap().1.len() == 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ambiguous_creation_times_preserve_roots_until_the_collision_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let first = dir.path().join("first");
+        let moved = dir.path().join("moved");
+        let other = dir.path().join("other");
+        for path in [&config, &first, &other] {
+            fs::create_dir(path).unwrap();
+        }
+        set_creation_time(&first);
+        set_creation_time(&other);
+        assert_eq!(identity(&first), identity(&other));
+        remember(&config, std::slice::from_ref(&first)).unwrap();
+        write_roots(&config, std::slice::from_ref(&first), &[]).unwrap();
+        let roots_before = fs::read(config.join("roots.txt")).unwrap();
+        let identities_before = fs::read(config.join("root-identities.json")).unwrap();
+        fs::rename(&first, &moved).unwrap();
+
+        let (resolved, missing) = resolve(&config, std::slice::from_ref(&first)).unwrap();
+        assert!(resolved.is_empty());
+        assert_eq!(missing, vec![first.clone()]);
+        assert_eq!(fs::read(config.join("roots.txt")).unwrap(), roots_before);
+        assert_eq!(
+            fs::read(config.join("root-identities.json")).unwrap(),
+            identities_before
+        );
+
+        fs::remove_dir(&other).unwrap();
+        let (resolved, missing) = resolve(&config, &[first]).unwrap();
+        assert_eq!(resolved, vec![moved]);
+        assert!(missing.is_empty());
     }
 
     #[test]
