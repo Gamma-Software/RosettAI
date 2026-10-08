@@ -269,7 +269,7 @@ fn rule_move_cleans_only_owned_outputs() {
     fs::write(&rule, "Moved into global guidance.\n").unwrap();
     let preview = ok(repo.path(), &["sync", "--dry-run"]);
     let preview = String::from_utf8_lossy(&preview.stdout);
-    assert!(preview.contains("Delete frontend/AGENTS.md"));
+    assert!(preview.contains("AGENTS.md — obsolete · will remove"));
     assert!(repo.path().join("frontend/AGENTS.md").exists());
     ok(repo.path(), &["sync"]);
     assert!(!repo.path().join("frontend/AGENTS.md").exists());
@@ -424,11 +424,18 @@ fn tracked_native_output_is_never_overwritten() {
 }
 
 #[test]
-fn modified_owned_output_is_preserved() {
+fn modified_output_without_marker_is_preserved() {
     let repo = repo();
     ok(repo.path(), &["sync"]);
     let path = repo.path().join("AGENTS.md");
-    let edited = format!("{}Local addition.\n", fs::read_to_string(&path).unwrap());
+    let edited = format!(
+        "{}Local addition.\n",
+        fs::read_to_string(&path)
+            .unwrap()
+            .split_once('\n')
+            .unwrap()
+            .1
+    );
     fs::write(&path, &edited).unwrap();
     fs::write(
         repo.path().join(".agents/rules/general.md"),
@@ -438,7 +445,7 @@ fn modified_owned_output_is_preserved() {
     failed(
         repo.path(),
         &["sync", "--git-hook"],
-        "unmanaged native configuration",
+        "unowned or modified output conflict: AGENTS.md",
     );
     assert_eq!(fs::read_to_string(path).unwrap(), edited);
 }

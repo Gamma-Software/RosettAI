@@ -1,3 +1,4 @@
+use crate::command_log::CommandExt;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -40,7 +41,11 @@ fn remove_global_hooks() -> Result<(), String> {
         } else {
             command.args(["--unset", "core.hooksPath"]);
         }
-        if !command.status().map_err(|e| e.to_string())?.success() {
+        if !command
+            .logged_status()
+            .map_err(|e| e.to_string())?
+            .success()
+        {
             return Err("could not restore global core.hooksPath".into());
         }
     }
@@ -102,7 +107,7 @@ fn remove_template() -> Result<(), String> {
     {
         let status = Command::new("git")
             .args(["config", "--global", "--unset", "init.templateDir"])
-            .status()
+            .logged_status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
             return Err("could not unset global init.templateDir".into());
@@ -167,7 +172,7 @@ fn remove_watcher() -> Result<(), String> {
     if owned_file(&service, "# rai-managed-watcher")? {
         let status = Command::new("systemctl")
             .args(["--user", "disable", "--now", "rai-watch.service"])
-            .status()
+            .logged_status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
             return Err("could not stop rai-watch.service".into());
@@ -175,7 +180,7 @@ fn remove_watcher() -> Result<(), String> {
         fs::remove_file(&service).map_err(|e| e.to_string())?;
         let status = Command::new("systemctl")
             .args(["--user", "daemon-reload"])
-            .status()
+            .logged_status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
             return Err("systemd daemon-reload failed".into());

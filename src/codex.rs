@@ -131,6 +131,7 @@ pub fn outputs(root: &Path) -> Result<Vec<(String, String)>, String> {
         }
     }
     config.push_str("\n[[hooks.UserPromptSubmit]]\n[[hooks.UserPromptSubmit.hooks]]\ntype = \"command\"\ncommand = \"rai sync --codex-hook\"\ntimeout = 30\n");
+    config.push_str("\n[[hooks.PreToolUse]]\nmatcher = \"^(apply_patch|Edit|Write)$\"\n[[hooks.PreToolUse.hooks]]\ntype = \"command\"\ncommand = \"rai guard\"\ntimeout = 10\n");
     let mut result = vec![(".codex/config.toml".to_string(), config)];
     for subagent in subagents {
         let name = subagent["name"].as_str().unwrap();

@@ -5,6 +5,7 @@
 /.github/copilot-instructions.md
 /.github/agents/reviewer.agent.md
 /.vscode/mcp.json
+/.claude/settings.json
 /CLAUDE.md
 /.claude/agents/reviewer.md
 /.claude/skills/release/SKILL.md

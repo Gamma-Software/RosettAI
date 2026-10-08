@@ -1,3 +1,4 @@
+use crate::command_log::CommandExt;
 use crate::{Action, native_sources, plan_sync, sync};
 use std::env;
 use std::fs;
@@ -218,7 +219,13 @@ pub fn change_workspace(old: &Path, replacement: Option<&Path>) -> Result<(), St
 fn watch_once(roots: &[PathBuf]) {
     for root in roots {
         for repo in discover(root) {
-            if let Err(error) = plan_sync(&repo).and_then(|changes| {
+            let args = vec![
+                "sync".into(),
+                "--repo".into(),
+                repo.to_string_lossy().into_owned(),
+            ];
+            let log = crate::command_log::Session::start(&args, Some(&repo), "watcher");
+            let result = plan_sync(&repo).and_then(|changes| {
                 if changes
                     .iter()
                     .all(|change| change.action == Action::Unchanged)
@@ -227,9 +234,11 @@ fn watch_once(roots: &[PathBuf]) {
                 } else {
                     sync(&repo, false)
                 }
-            }) {
+            });
+            if let Err(error) = &result {
                 eprintln!("rai watch: {}: {error}", repo.display());
             }
+            log.finish(&result);
         }
     }
 }
@@ -370,7 +379,7 @@ fn install_global_hooks(config: &Path, executable: &Path) -> Result<(), String> 
         let status = Command::new("git")
             .args(["config", "--global", "core.hooksPath"])
             .arg(&hooks)
-            .status()
+            .logged_status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
             return Err("could not configure global core.hooksPath".into());
@@ -431,7 +440,7 @@ fn install_hook_template(config: &Path, executable: &Path) -> Result<(), String>
     let status = Command::new("git")
         .args(["config", "--global", "init.templateDir"])
         .arg(&template)
-        .status()
+        .logged_status()
         .map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("could not configure Git template directory".into());

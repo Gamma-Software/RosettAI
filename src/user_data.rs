@@ -1,3 +1,5 @@
+#[cfg(not(windows))]
+use crate::command_log::CommandExt;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +20,22 @@ pub fn config_dir() -> Result<PathBuf, String> {
         let previous = home.join(".config/rai");
         migrate(&previous, &current)?;
         Ok(current)
+    }
+}
+
+/// Resolve the transcript location without migrating configuration or running
+/// Git (help and version must remain usable independently of machine setup).
+pub fn logs_dir() -> Result<PathBuf, String> {
+    #[cfg(windows)]
+    {
+        Ok(PathBuf::from(env::var_os("APPDATA").ok_or("APPDATA is not set")?).join("rai/logs"))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
+            return Ok(PathBuf::from(xdg).join("rai/logs"));
+        }
+        Ok(PathBuf::from(env::var_os("HOME").ok_or("HOME is not set")?).join(".rai/logs"))
     }
 }
 
@@ -116,7 +134,7 @@ fn update_git_template(previous: &Path, current: &Path) -> Result<(), String> {
         let status = Command::new("git")
             .args(["config", "--global", "init.templateDir"])
             .arg(current.join("git-template"))
-            .status()
+            .logged_status()
             .map_err(|e| e.to_string())?;
         if !status.success() {
             return Err("could not update global init.templateDir".into());

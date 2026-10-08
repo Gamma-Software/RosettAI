@@ -1,3 +1,4 @@
+use crate::command_log::CommandExt;
 use chrono::Local;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
@@ -7,11 +8,16 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+#[macro_use]
+mod command_log;
 mod claude;
 mod codex;
+mod comparison;
 mod copilot;
 mod hook_registry;
 mod perf;
+mod projection_backup;
+mod projection_guard;
 mod root_tracking;
 mod setup;
 mod terminal;
@@ -36,33 +42,195 @@ enum Action {
 }
 
 struct Change {
+    recovery: Option<projection_backup::Backup>,
     path: PathBuf,
     content: String,
     action: Action,
+    comparison: Option<comparison::Comparison>,
+}
+
+struct SyncConflict {
+    path: PathBuf,
+    error: String,
+    message: &'static str,
+    comparison: Option<comparison::Comparison>,
+}
+
+#[derive(Default)]
+struct SyncPlan {
+    changes: Vec<Change>,
+    conflicts: Vec<SyncConflict>,
+}
+
+impl SyncPlan {
+    fn error(&self) -> Option<String> {
+        (!self.conflicts.is_empty()).then(|| {
+            self.conflicts
+                .iter()
+                .map(|conflict| conflict.error.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let is_update = args
-        .first()
-        .is_some_and(|arg| matches!(arg.as_str(), "update" | "uninstall"));
+    let source = if args.iter().any(|arg| arg == "--git-hook") {
+        "git-hook"
+    } else if args.iter().any(|arg| arg == "--codex-hook") {
+        "codex-hook"
+    } else {
+        "cli"
+    };
+    let log = command_log::Session::start(&args, log_project(&args).as_deref(), source);
+    let skip_update_check = args.first().is_some_and(|arg| {
+        matches!(
+            arg.as_str(),
+            "guard" | "update" | "uninstall" | "version" | "--version" | "-V"
+        )
+    });
     let snapshot = args
         .iter()
         .any(|arg| arg == "--perf")
         .then(perf::Snapshot::start);
+    let sync_guidance = (args.first().is_some_and(|command| command == "sync")
+        && !args.iter().any(|arg| arg == "--codex-hook"))
+    .then(|| {
+        let repo = args.windows(2).find(|pair| pair[0] == "--repo");
+        repo.map_or_else(
+            || "rai doctor".to_owned(),
+            |pair| format!("rai doctor --repo {}", quote_sync_argument(&pair[1])),
+        )
+    });
     let result = run(args);
     if let Err(error) = &result {
         eprintln!("rai: {error}");
+        if let Some(command) = sync_guidance {
+            if !error.starts_with("tracked output conflict:")
+                && !error.starts_with("unowned or modified output conflict:")
+                && !error.starts_with("symlink output conflict:")
+                && !error.starts_with("unmanaged native configuration:")
+                && !error.starts_with("malformed RosettAI block")
+            {
+                eprintln!("Solution: {}", solution_for_plan_error(error));
+            }
+            eprintln!("For guided diagnosis and available fixes: {command}");
+        }
     }
     if let Some(snapshot) = snapshot {
         snapshot.emit();
     }
-    if !is_update {
+    if !skip_update_check {
         update::automatic_warning();
     }
+    log.finish(&result);
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
+    }
+}
+
+fn log_project(args: &[String]) -> Option<PathBuf> {
+    if args.first().is_some_and(|arg| {
+        matches!(
+            arg.as_str(),
+            "help"
+                | "--help"
+                | "-h"
+                | "version"
+                | "--version"
+                | "-V"
+                | "install"
+                | "uninstall"
+                | "update"
+                | "watch"
+        )
+    }) || args.is_empty()
+    {
+        return None;
+    }
+    let start = args
+        .windows(2)
+        .rfind(|pair| pair[0] == "--repo")
+        .map(|pair| PathBuf::from(&pair[1]))
+        .or_else(|| env::current_dir().ok())?;
+    let start = start.canonicalize().unwrap_or_else(|_| {
+        if start.is_absolute() {
+            start.clone()
+        } else {
+            env::current_dir().unwrap_or_default().join(&start)
+        }
+    });
+    let manual_sync = args.first().is_some_and(|arg| arg == "sync")
+        && !args.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "--git-hook" | "--codex-hook" | "--dry-run" | "--json"
+            )
+        });
+    if manual_sync
+        || args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "init" | "migrate" | "rollback"))
+    {
+        Some(git_root(&start).unwrap_or(start))
+    } else {
+        Some(find_repo(&start).unwrap_or_else(|_| git_root(&start).unwrap_or(start)))
+    }
+}
+
+fn run_logged(args: Vec<String>) -> Result<(), String> {
+    let log = command_log::Session::start(&args, log_project(&args).as_deref(), "helper");
+    let result = run(args);
+    log.finish(&result);
+    result
+}
+
+// Suggest only a unique nearest public command, never internal hook/watch commands.
+fn suggest_command(input: &str) -> Option<&'static str> {
+    let mut best = None;
+    let mut best_distance = usize::MAX;
+    let mut tied = false;
+    for candidate in [
+        "help",
+        "version",
+        "sync",
+        "doctor",
+        "install",
+        "uninstall",
+        "update",
+        "init",
+        "migrate",
+        "rollback",
+        "status",
+    ] {
+        let mut row: Vec<usize> = (0..=candidate.len()).collect();
+        for (i, character) in input.chars().enumerate() {
+            let mut diagonal = row[0];
+            row[0] = i + 1;
+            for (j, expected) in candidate.chars().enumerate() {
+                let previous = row[j + 1];
+                row[j + 1] = (row[j] + 1)
+                    .min(previous + 1)
+                    .min(diagonal + usize::from(character != expected));
+                diagonal = previous;
+            }
+        }
+        let distance = row[candidate.len()];
+        if distance < best_distance {
+            best = Some(candidate);
+            best_distance = distance;
+            tied = false;
+        } else if distance == best_distance {
+            tied = true;
+        }
+    }
+    let limit = if input.chars().count() >= 5 { 2 } else { 1 };
+    if !tied && best_distance <= limit && input.chars().count() >= 2 {
+        best
+    } else {
+        None
     }
 }
 
@@ -73,10 +241,57 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
         return print_help();
     }
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        return print_version();
+    }
+    if args.as_slice() == ["guard"] {
+        return projection_guard::run();
+    }
     let mut args = args.into_iter();
-    let command = args.next().ok_or_else(usage)?;
+    let mut command = args.next().ok_or_else(usage)?;
+    if !matches!(
+        command.as_str(),
+        "help"
+            | "version"
+            | "sync"
+            | "doctor"
+            | "install"
+            | "uninstall"
+            | "update"
+            | "init"
+            | "migrate"
+            | "rollback"
+            | "status"
+            | "watch"
+    ) {
+        let remaining: Vec<String> = args.collect();
+        let mut error = format!("unknown command: {command}");
+        if let Some(suggestion) = suggest_command(&command) {
+            error.push_str(&format!("\nDid you mean `rai {suggestion}`?"));
+            if io::stdin().is_terminal()
+                && !remaining
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "--json" | "--git-hook" | "--codex-hook"))
+            {
+                eprintln!("rai: {error}");
+                eprint!("Run rai {suggestion}? [y/N] ");
+                io::stderr().flush().map_err(|e| e.to_string())?;
+                let mut answer = String::new();
+                io::stdin()
+                    .read_line(&mut answer)
+                    .map_err(|e| e.to_string())?;
+                if matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    command = suggestion.to_owned();
+                    return run_logged(std::iter::once(command).chain(remaining).collect());
+                }
+                return Err("command cancelled".into());
+            }
+        }
+        return Err(format!("{error}\n{}", usage()));
+    }
     let mut dry_run = false;
     let mut json = false;
+    let mut compact = false;
     let mut perf = false;
     let mut codex_hook = false;
     let mut git_hook = false;
@@ -86,6 +301,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         match arg.as_str() {
             "--dry-run" => dry_run = true,
             "--json" => json = true,
+            "--compact" => compact = true,
             "--perf" => perf = true,
             "--codex-hook" => codex_hook = true,
             "--git-hook" => git_hook = true,
@@ -94,14 +310,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
             _ => return Err(format!("unknown option: {arg}")),
         }
     }
-    if command == "help" {
-        if dry_run || json || codex_hook || git_hook || repo.is_some() || !roots.is_empty() {
-            return Err("help accepts only --perf".into());
+    if matches!(command.as_str(), "help" | "version") {
+        if dry_run
+            || json
+            || compact
+            || codex_hook
+            || git_hook
+            || repo.is_some()
+            || !roots.is_empty()
+        {
+            return Err(format!("{command} accepts only --perf"));
         }
-        return print_help();
+        return if command == "version" {
+            print_version()
+        } else {
+            print_help()
+        };
     }
     if dry_run && command != "sync" {
         return Err("--dry-run is only valid with sync".into());
+    }
+    if compact && command != "sync" {
+        return Err("--compact is only valid with sync".into());
     }
     if json && !matches!(command.as_str(), "sync" | "status" | "doctor") {
         return Err("--json is only valid with sync, status, or doctor".into());
@@ -160,6 +390,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
             read_rules(&root)?;
         }
         let mut native = native_sources(&root)?;
+        if root.join(".agents").is_dir() && has_modified_native_projection(&root, &native)? {
+            return sync_with_format(&root, false, false, compact);
+        }
+        if !native.is_empty() && root.join(".agents").is_dir() {
+            print_native_sync_inventory(&root, &native, false, compact)?;
+        }
         if !native.is_empty() {
             while !native.is_empty() {
                 let previous = existing_migration_backup(&root)?;
@@ -235,7 +471,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
     };
     if command == "sync" && (git_hook || dry_run || json) {
         let native = native_sources(&root)?;
+        if has_modified_native_projection(&root, &native)? {
+            return sync_with_format(&root, dry_run, json, compact);
+        }
         if !native.is_empty() {
+            if !json {
+                print_native_sync_inventory(&root, &native, dry_run, compact)?;
+            }
             let error = format!(
                 "unmanaged native configuration: {}; run rai sync manually to review migration",
                 native.join(", ")
@@ -248,7 +490,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
     match command.as_str() {
         "sync" if codex_hook => sync_codex_hook(&root),
-        "sync" => sync_with_format(&root, dry_run, json),
+        "sync" => sync_with_format(&root, dry_run, json, compact),
         "status" => status(&root, json),
         "doctor" => doctor(&root, json),
         _ => Err(usage()),
@@ -256,12 +498,27 @@ fn run(args: Vec<String>) -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: rai [help|init|sync|doctor|status|install|uninstall|migrate|rollback|update] [options]"
-        .into()
+    "usage: rai [install|sync|doctor|update|version|uninstall|help] [options]".into()
+}
+
+fn print_version() -> Result<(), String> {
+    let mut out = command_log::stdout();
+    writeln!(out, "rai {}", env!("CARGO_PKG_VERSION")).map_err(|e| e.to_string())?;
+    writeln!(
+        out,
+        "commit: {}{}",
+        env!("RAI_BUILD_COMMIT"),
+        if env!("RAI_BUILD_DIRTY") == "true" {
+            " (dirty)"
+        } else {
+            ""
+        }
+    )
+    .map_err(|e| e.to_string())
 }
 
 fn print_help() -> Result<(), String> {
-    let mut out = io::stdout().lock();
+    let mut out = command_log::stdout();
     let color = out.is_terminal();
     let title = format!("◆ ROSETTAI  ·  {}", env!("CARGO_PKG_VERSION"));
     let rows = [
@@ -278,11 +535,16 @@ fn print_help() -> Result<(), String> {
             "rai sync        Set up and synchronize this project",
             terminal::ACCENT,
         ),
+        ("  --compact     Show a compact synchronization report", "2"),
         (
             "rai doctor      Check setup and fix problems",
             terminal::ACCENT,
         ),
         ("rai update      Update rai", terminal::ACCENT),
+        (
+            "rai version     Show version and build commit",
+            terminal::ACCENT,
+        ),
         (
             "rai uninstall   Stop and remove automatic sync",
             terminal::ACCENT,
@@ -328,15 +590,16 @@ fn helper() -> Result<(), String> {
             return Ok(());
         }
         match choice.trim() {
-            "1" => run(vec![
+            "1" => run_logged(vec![
                 "sync".into(),
                 "--repo".into(),
                 current.to_string_lossy().into_owned(),
             ])?,
-            "2" => {
-                let root = find_repo(&current).unwrap_or(current.clone());
-                doctor(&root, false)?;
-            }
+            "2" => run_logged(vec![
+                "doctor".into(),
+                "--repo".into(),
+                current.to_string_lossy().into_owned(),
+            ])?,
             "3" => machine_helper(&current)?,
             "4" => print_help()?,
             "q" | "Q" => return Ok(()),
@@ -356,7 +619,11 @@ fn machine_helper(current: &Path) -> Result<(), String> {
         .read_line(&mut choice)
         .map_err(|e| e.to_string())?;
     match choice.trim() {
-        "1" => setup::setup(vec![current.to_path_buf()]),
+        "1" => run_logged(vec![
+            "install".into(),
+            "--root".into(),
+            current.to_string_lossy().into_owned(),
+        ]),
         "2" => {
             print!("Workspace directory to watch: ");
             io::stdout().flush().map_err(|e| e.to_string())?;
@@ -367,12 +634,16 @@ fn machine_helper(current: &Path) -> Result<(), String> {
             if path.trim().is_empty() {
                 Ok(())
             } else {
-                setup::setup(vec![PathBuf::from(path.trim())])
+                run_logged(vec!["install".into(), "--root".into(), path.trim().into()])
             }
         }
-        "3" => update::install(),
-        "4" => uninstall::uninstall(),
-        "5" => rollback_migration(current),
+        "3" => run_logged(vec!["update".into()]),
+        "4" => run_logged(vec!["uninstall".into()]),
+        "5" => run_logged(vec![
+            "rollback".into(),
+            "--repo".into(),
+            current.to_string_lossy().into_owned(),
+        ]),
         "" => Ok(()),
         _ => {
             println!("Choose 1–5 or press Enter.");
@@ -414,12 +685,12 @@ fn git_root(start: &Path) -> Option<PathBuf> {
 }
 
 fn sync(root: &Path, dry_run: bool) -> Result<(), String> {
-    sync_with_format(root, dry_run, false)
+    sync_with_format(root, dry_run, false, false)
 }
 
-fn sync_with_format(root: &Path, dry_run: bool, json: bool) -> Result<(), String> {
-    let changes = match plan_sync(root) {
-        Ok(changes) => changes,
+fn sync_with_format(root: &Path, dry_run: bool, json: bool, compact: bool) -> Result<(), String> {
+    let plan = match inspect_sync(root) {
+        Ok(plan) => plan,
         Err(error) => {
             if json {
                 println!("{{\"ok\":false,\"error\":{}}}", json_string(&error));
@@ -427,27 +698,47 @@ fn sync_with_format(root: &Path, dry_run: bool, json: bool) -> Result<(), String
             return Err(error);
         }
     };
-    if json {
-        print_changes_json(root, &changes, dry_run);
-    } else {
-        for change in &changes {
-            let relative = change
-                .path
-                .strip_prefix(root)
-                .expect("planned path inside repo");
-            println!("{:?} {}", change.action, relative.display());
+    if let Some(error) = plan.error() {
+        if json {
+            println!("{{\"ok\":false,\"error\":{}}}", json_string(&error));
+        } else {
+            print_sync_inventory(root, &plan.changes, &plan.conflicts, dry_run, compact)?;
         }
-        if dry_run {
-            println!("dry-run: no files written");
-        }
+        return Err(error);
     }
+    let changes = plan.changes;
     if dry_run {
-        return Ok(());
+        if json {
+            print_changes_json(root, &changes, true);
+        }
+        return if json {
+            Ok(())
+        } else {
+            print_sync_report(root, &changes, true, compact)
+        };
     }
-    apply_changes(changes)
+    if let Err(error) = apply_changes(&changes) {
+        if json {
+            println!("{{\"ok\":false,\"error\":{}}}", json_string(&error));
+        }
+        return Err(error);
+    }
+    if json {
+        print_changes_json(root, &changes, false);
+        Ok(())
+    } else {
+        print_sync_report(root, &changes, false, compact)
+    }
 }
 
-fn apply_changes(changes: Vec<Change>) -> Result<(), String> {
+fn apply_changes(changes: &[Change]) -> Result<(), String> {
+    // Save every edited projection before replacing any output. A failed backup
+    // leaves the repository unchanged.
+    for change in changes {
+        if let Some(backup) = &change.recovery {
+            backup.save(&change.path)?;
+        }
+    }
     for change in changes {
         if change.action == Action::Unchanged {
             continue;
@@ -459,10 +750,501 @@ fn apply_changes(changes: Vec<Change>) -> Result<(), String> {
         if let Some(parent) = change.path.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
-        fs::write(&change.path, change.content)
+        fs::write(&change.path, &change.content)
             .map_err(|e| format!("{}: {e}", change.path.display()))?;
     }
     Ok(())
+}
+
+fn print_sync_report(
+    root: &Path,
+    changes: &[Change],
+    dry_run: bool,
+    compact: bool,
+) -> Result<(), String> {
+    print_sync_inventory(root, changes, &[], dry_run, compact)
+}
+
+fn print_native_sync_inventory(
+    root: &Path,
+    native: &[String],
+    dry_run: bool,
+    compact: bool,
+) -> Result<(), String> {
+    // Validation failures cannot produce reliable per-file states. The caller
+    // retains the original migration diagnostic in that case.
+    if let Ok(mut plan) = inspect_sync(root) {
+        for relative in native {
+            let path = root.join(relative);
+            if !plan
+                .conflicts
+                .iter()
+                .any(|conflict| conflict.path.starts_with(&path))
+            {
+                plan.conflicts.push(SyncConflict {
+                    comparison: None,
+                    path,
+                    error: format!("unmanaged native configuration: {relative}"),
+                    message: "unmanaged native configuration · migration required · not overwritten",
+                });
+            }
+        }
+        print_sync_inventory(root, &plan.changes, &plan.conflicts, dry_run, compact)?;
+    }
+    Ok(())
+}
+
+fn print_sync_inventory(
+    root: &Path,
+    changes: &[Change],
+    conflicts: &[SyncConflict],
+    dry_run: bool,
+    compact: bool,
+) -> Result<(), String> {
+    let mut out = command_log::stdout();
+    let color = out.is_terminal();
+    let blocked = !conflicts.is_empty();
+    let render = |out: &mut command_log::Output<std::io::StdoutLock<'_>>| -> io::Result<()> {
+        writeln!(
+            out,
+            "\n  {}",
+            terminal::style(
+                if blocked {
+                    "Synchronization blocked"
+                } else if dry_run {
+                    "Sync preview"
+                } else {
+                    "Synchronization complete"
+                },
+                "1",
+                color
+            )
+        )?;
+        writeln!(
+            out,
+            "  {}\n",
+            terminal::style(".agents/ → your coding agents' configuration", "2", color)
+        )?;
+        let count = |action| {
+            changes
+                .iter()
+                .filter(|change| change.action == action)
+                .count()
+        };
+        let created = count(Action::Create);
+        let updated = count(Action::Update);
+        let removed = count(Action::Delete);
+        let synchronized = count(Action::Unchanged);
+        writeln!(out)?;
+        if blocked {
+            writeln!(
+                out,
+                "  {}",
+                terminal::style(
+                    &format!(
+                        "State: {synchronized} synchronized, {} warning(s); {created} to create, {updated} to update, {removed} to remove.",
+                        conflicts.len()
+                    ),
+                    "33",
+                    color
+                )
+            )?;
+            writeln!(out, "  Sync blocked. No files changed.")?;
+            writeln!(
+                out,
+                "  After resolving the warnings, preview: rai sync --repo {} --dry-run",
+                quote_sync_argument(&root.to_string_lossy())
+            )?;
+            writeln!(
+                out,
+                "  Then synchronize: rai sync --repo {}",
+                quote_sync_argument(&root.to_string_lossy())
+            )?;
+        } else if changes.is_empty() {
+            writeln!(out, "  No harness files need synchronization.")?;
+        } else if created + updated + removed == 0 {
+            writeln!(
+                out,
+                "  {}",
+                terminal::style("Everything is synchronized. No files changed.", "32", color)
+            )?;
+            writeln!(out, "  {synchronized} already synchronized.")?;
+        } else if dry_run {
+            writeln!(
+                out,
+                "  Planned: {created} to create, {updated} to update, {removed} to remove; {synchronized} already synchronized."
+            )?;
+        } else {
+            writeln!(
+                out,
+                "  Result: {created} created, {updated} updated, {removed} removed; {synchronized} already synchronized."
+            )?;
+        }
+        if dry_run {
+            writeln!(out, "  dry-run: no files written")?;
+        }
+        let mut entries: BTreeMap<&Path, SyncEntry<'_>> = BTreeMap::new();
+        for change in changes {
+            if !compact || change.action != Action::Unchanged || change.recovery.is_some() {
+                entries.entry(&change.path).or_default().change = Some(change);
+            }
+        }
+        for conflict in conflicts {
+            entries.entry(&conflict.path).or_default().conflict = Some(conflict);
+        }
+        if compact {
+            if !entries.is_empty() {
+                writeln!(out)?;
+                print_sync_entries(out, root, &entries, dry_run || blocked, color)?;
+            }
+        } else {
+            for group in SyncGroup::ALL {
+                let group_entries: BTreeMap<_, _> = entries
+                    .iter()
+                    .filter(|(path, _)| {
+                        SyncGroup::for_path(path.strip_prefix(root).unwrap()) == group
+                    })
+                    .map(|(path, entry)| (*path, *entry))
+                    .collect();
+                if group_entries.is_empty() {
+                    continue;
+                }
+                let count = |action| {
+                    group_entries
+                        .values()
+                        .filter(|entry| entry.change.is_some_and(|change| change.action == action))
+                        .count()
+                };
+                let warnings = group_entries
+                    .values()
+                    .filter(|entry| entry.conflict.is_some())
+                    .count();
+                let counts = if dry_run || blocked {
+                    format!(
+                        "{} to create · {} to update · {} to remove · {} unchanged",
+                        count(Action::Create),
+                        count(Action::Update),
+                        count(Action::Delete),
+                        count(Action::Unchanged)
+                    )
+                } else {
+                    format!(
+                        "{} created · {} updated · {} removed · {} unchanged",
+                        count(Action::Create),
+                        count(Action::Update),
+                        count(Action::Delete),
+                        count(Action::Unchanged)
+                    )
+                };
+                writeln!(out, "\n  {}", terminal::style(group.label(), "1", color))?;
+                writeln!(out, "  {}", terminal::style(&counts, "2", color))?;
+                if warnings > 0 {
+                    writeln!(
+                        out,
+                        "  {}",
+                        terminal::style(&format!("{warnings} warning(s)"), "33", color)
+                    )?;
+                }
+                print_sync_entries(out, root, &group_entries, dry_run || blocked, color)?;
+            }
+        }
+        writeln!(out)?;
+        writeln!(
+            out,
+            "  {}\n",
+            terminal::style(
+                "Edit shared configuration in .agents/; rai sync applies it to your agents.",
+                "2",
+                color
+            )
+        )?;
+        out.flush()
+    };
+    render(&mut out).map_err(|e| e.to_string())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SyncGroup {
+    Codex,
+    Claude,
+    Copilot,
+    Maintenance,
+}
+
+impl SyncGroup {
+    const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Copilot, Self::Maintenance];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+            Self::Copilot => "GitHub Copilot",
+            Self::Maintenance => "Project maintenance",
+        }
+    }
+
+    fn for_path(path: &Path) -> Self {
+        if path.starts_with(".codex") || path.file_name().is_some_and(|name| name == "AGENTS.md") {
+            Self::Codex
+        } else if path.starts_with(".claude")
+            || path == Path::new(".mcp.json")
+            || path.file_name().is_some_and(|name| name == "CLAUDE.md")
+        {
+            Self::Claude
+        } else if path.starts_with(".github") || path.starts_with(".vscode") {
+            Self::Copilot
+        } else {
+            Self::Maintenance
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct SyncEntry<'a> {
+    change: Option<&'a Change>,
+    conflict: Option<&'a SyncConflict>,
+}
+
+fn print_sync_entries(
+    out: &mut impl Write,
+    root: &Path,
+    entries: &BTreeMap<&Path, SyncEntry<'_>>,
+    dry_run: bool,
+    color: bool,
+) -> io::Result<()> {
+    // Keep conflicts and repair guidance ahead of ordinary file states.
+    for (path, entry) in entries
+        .iter()
+        .filter(|(_, entry)| entry.conflict.is_some())
+        .chain(entries.iter().filter(|(_, entry)| entry.conflict.is_none()))
+    {
+        let relative = path.strip_prefix(root).expect("planned path inside repo");
+        // A skill is one resource; keep exact file paths for conflicts and backups.
+        let skill = entry.conflict.is_none()
+            && relative.starts_with(".claude/skills")
+            && relative.components().count() == 4
+            && relative.file_name().is_some_and(|name| name == "SKILL.md")
+            && entry.change.is_some_and(|change| change.recovery.is_none());
+        let name = if skill {
+            format!("{}/", display_sync_path(relative.parent().unwrap()))
+        } else {
+            display_sync_path(relative)
+        };
+        if let Some(conflict) = entry.conflict {
+            writeln!(
+                out,
+                "    {} {} — {}",
+                terminal::style("⚠", "33", color),
+                terminal::style(&name, "1", color),
+                terminal::style(conflict.message, "33", color)
+            )?;
+        } else if let Some(change) = entry.change {
+            let ignore = change.path.strip_prefix(root).ok() == Some(Path::new(".gitignore"));
+            let placeholder = change.action == Action::Delete
+                && change.path.starts_with(root.join(".agents"))
+                && change.path.file_name().is_some_and(|name| name == ".keep");
+            let (mark, code, message) = if placeholder {
+                (
+                    "−",
+                    "33",
+                    if dry_run {
+                        "directory is populated · will remove placeholder"
+                    } else {
+                        "removed placeholder from populated directory"
+                    },
+                )
+            } else if change.recovery.is_some() {
+                (
+                    "↻",
+                    "33",
+                    if dry_run {
+                        "modified generated file · will back up and resynchronize from .agents/"
+                    } else {
+                        "modified generated file · backed up and resynchronized from .agents/"
+                    },
+                )
+            } else {
+                sync_change_description(&change.action, dry_run, ignore)
+            };
+            writeln!(
+                out,
+                "    {} {} — {}",
+                terminal::style(mark, code, color),
+                terminal::style(&name, "1", color),
+                terminal::style(message, code, color)
+            )?;
+        }
+        let comparison = entry
+            .conflict
+            .and_then(|conflict| conflict.comparison.as_ref())
+            .or_else(|| {
+                entry
+                    .change
+                    .filter(|_| !skill)
+                    .and_then(|change| change.comparison.as_ref())
+            });
+        if let Some(comparison) = comparison {
+            let before = if !dry_run
+                && entry
+                    .change
+                    .is_some_and(|change| change.action == Action::Update)
+            {
+                "before sync · "
+            } else {
+                ""
+            };
+            writeln!(
+                out,
+                "      {}",
+                terminal::style(
+                    &format!("{before}local ↔ expected: {}", comparison.description()),
+                    "2",
+                    color
+                )
+            )?;
+        }
+        if let Some(backup) = entry.change.and_then(|change| change.recovery.as_ref()) {
+            writeln!(
+                out,
+                "      {}",
+                terminal::style(
+                    &format!(
+                        "{}: {}",
+                        if dry_run {
+                            "Backup planned"
+                        } else {
+                            "Backup saved"
+                        },
+                        backup.path.display()
+                    ),
+                    "33",
+                    color
+                )
+            )?;
+            writeln!(
+                out,
+                "      {}",
+                terminal::style(
+                    "Author unknown · copy any edits you want to keep into .agents/.",
+                    "2",
+                    color
+                )
+            )?;
+        }
+        if let Some(conflict) = entry.conflict {
+            for solution in solutions_for_sync_conflict(root, conflict) {
+                writeln!(
+                    out,
+                    "      {}",
+                    terminal::style(&solution, terminal::ACCENT, color)
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn display_sync_path(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn quote_sync_argument(value: &str) -> String {
+    if cfg!(windows) {
+        // Display commands for PowerShell on Windows.
+        format!("'{}'", value.replace('\'', "''"))
+    } else {
+        setup::shell_quote(value)
+    }
+}
+
+fn solutions_for_sync_conflict(root: &Path, conflict: &SyncConflict) -> Vec<String> {
+    let relative = conflict.path.strip_prefix(root).unwrap();
+    let file = quote_sync_argument(&display_sync_path(relative));
+    let repo = quote_sync_argument(&root.to_string_lossy());
+    let error = conflict.error.as_str();
+    if error.starts_with("tracked output conflict:") {
+        vec![
+            "Solution: keep intended edits in .agents/ before removing the native file from Git tracking.".into(),
+            "Removing Git tracking keeps the local file and stages its removal from Git:".into(),
+            format!("git -C {repo} rm --cached -- {file}"),
+            "If local edits still block sync after untracking, follow the keep/regenerate steps on the next preview.".into(),
+        ]
+    } else if error.starts_with("unowned or modified output conflict:") {
+        let canonical = if relative
+            .file_name()
+            .is_some_and(|name| name == "AGENTS.md" || name == "CLAUDE.md")
+        {
+            let scope = relative
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty());
+            scope.map_or_else(
+                || ".agents/rules/ (global rules)".to_owned(),
+                |scope| format!(".agents/rules/ with path: {}", display_sync_path(scope)),
+            )
+        } else if relative.starts_with(".github/instructions")
+            || relative.starts_with(".claude/rules")
+            || relative == Path::new(".github/copilot-instructions.md")
+        {
+            ".agents/rules/ (preserve each rule's path/scope)".into()
+        } else if relative.starts_with(".claude/skills") {
+            ".agents/skills/ in the matching skill".into()
+        } else if relative.starts_with(".codex/agents")
+            || relative.starts_with(".github/agents")
+            || relative.starts_with(".claude/agents")
+        {
+            ".agents/agents/ (or the existing .agents/subagents/)".into()
+        } else {
+            "the matching resource in .agents/ (MCP servers belong in .agents/mcp.yaml); retain unsupported harness settings separately".into()
+        };
+        vec![
+            format!(
+                "Keep local edits: copy the changes you want into {canonical}, then move {file} to a backup outside this repository."
+            ),
+            format!(
+                "Use the canonical version: move {file} to a backup outside this repository without copying its edits into .agents/."
+            ),
+        ]
+    } else if error.contains("symlink") {
+        vec![format!(
+            "Solution: inspect the target of {file}; replace the link (or its linked parent) with a regular file/directory, preserving the target contents. Rai will not follow or replace it."
+        )]
+    } else if error.starts_with("malformed RosettAI block") {
+        vec![format!(
+            "Solution: back up {file}, then repair the '{IGNORE_START}' and '{IGNORE_END}' markers in their original order. Preserve all ignore rules outside that block."
+        )]
+    } else if error.starts_with("unmanaged native configuration:") {
+        vec![format!(
+            "Solution: run rai sync --repo {repo} manually to review migration. Convert unsupported configuration into .agents/ yourself, preserving harness-specific settings separately."
+        )]
+    } else {
+        vec![format!(
+            "Solution: check that {file} is a regular readable file and that you have access to its parent directories. Back up its contents before repairing permissions or replacing it."
+        )]
+    }
+}
+
+fn sync_change_description(
+    action: &Action,
+    dry_run: bool,
+    ignore: bool,
+) -> (&'static str, &'static str, &'static str) {
+    match (action, dry_run, ignore) {
+        (Action::Unchanged, _, false) => ("✓", "32", "already synchronized"),
+        (Action::Unchanged, _, true) => ("✓", "32", "ignore entries already synchronized"),
+        (Action::Create, true, false) => ("+", terminal::ACCENT, "will create"),
+        (Action::Create, false, false) => ("+", terminal::ACCENT, "created"),
+        (Action::Create, true, true) => ("+", terminal::ACCENT, "will create ignore entries"),
+        (Action::Create, false, true) => ("+", terminal::ACCENT, "created with ignore entries"),
+        (Action::Update, true, false) => ("↻", terminal::ACCENT, "will update from .agents/"),
+        (Action::Update, false, false) => ("↻", terminal::ACCENT, "updated from .agents/"),
+        (Action::Update, true, true) => ("↻", terminal::ACCENT, "will update ignore entries"),
+        (Action::Update, false, true) => ("↻", terminal::ACCENT, "ignore entries updated"),
+        (Action::Delete, true, _) => ("−", "33", "obsolete · will remove"),
+        (Action::Delete, false, _) => ("−", "33", "removed obsolete output"),
+    }
 }
 
 fn sync_codex_hook(root: &Path) -> Result<(), String> {
@@ -471,7 +1253,7 @@ fn sync_codex_hook(root: &Path) -> Result<(), String> {
         .read_to_string(&mut input)
         .map_err(|e| e.to_string())?;
     let native = native_sources(root)?;
-    if !native.is_empty() {
+    if !native.is_empty() && !has_modified_native_projection(root, &native)? {
         print_codex_hook_result(&format!(
             "RosettAI found unmanaged native configuration: {}. Run rai sync manually to review migration.",
             native.join(", ")
@@ -505,7 +1287,7 @@ fn sync_codex_hook(root: &Path) -> Result<(), String> {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    match apply_changes(changes) {
+    match apply_changes(&changes) {
         Ok(()) => print_codex_hook_result(&format!(
             "RosettAI synchronized {paths}. Resubmit the prompt in a new Codex session so instructions and MCP config reload."
         )),
@@ -561,37 +1343,134 @@ fn projection_outputs(
 }
 
 fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
+    let plan = inspect_sync(root)?;
+    if let Some(error) = plan.error() {
+        return Err(error);
+    }
+    Ok(plan.changes)
+}
+
+fn plan_keep_cleanup(agents: &Path, changes: &mut Vec<Change>) -> Result<(), String> {
+    let mut directories = vec![agents.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let mut entries = fs::read_dir(&directory)
+            .map_err(|e| format!("{}: {e}", directory.display()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("{}: {e}", directory.display()))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        let populated = directory != agents && entries.len() > 1;
+        for entry in entries {
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            // Never traverse linked directories or delete linked placeholders.
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if populated && file_type.is_file() && entry.file_name() == ".keep" {
+                changes.push(Change {
+                    recovery: None,
+                    comparison: None,
+                    path,
+                    content: String::new(),
+                    action: Action::Delete,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_sync(root: &Path) -> Result<SyncPlan, String> {
     let rules = read_rules(root)?;
     codex::check_version()?;
     let outputs = projection_outputs(root, &rules)?;
+    let output_paths = outputs
+        .iter()
+        .map(|(relative, _, _)| relative.clone())
+        .collect::<Vec<_>>();
 
-    // Plan every write before applying any of them. A single collision aborts the sync.
-    let mut changes = Vec::new();
+    // Inspect every destination before applying anything. Conflicts block all writes,
+    // but do not hide the state of the remaining projections.
+    let mut plan = SyncPlan::default();
+    let changes = &mut plan.changes;
+    let conflicts = &mut plan.conflicts;
+    plan_keep_cleanup(&root.join(".agents"), changes)?;
     for (relative, content, marker) in outputs {
         let path = root.join(&relative);
         if is_tracked(root, &relative)? {
-            return Err(format!(
-                "tracked output conflict: {relative}; remove it from Git tracking first"
-            ));
+            conflicts.push(SyncConflict {
+                comparison: if !output_has_symlink(root, &path) && path.is_file() {
+                    fs::read_to_string(&path)
+                        .ok()
+                        .filter(|current| current != &content)
+                        .map(|current| comparison::compare(&current, &content, &marker))
+                } else {
+                    None
+                },
+                path,
+                error: format!(
+                    "tracked output conflict: {relative}; remove it from Git tracking first"
+                ),
+                message: "tracked by Git · cannot synchronize · not overwritten",
+            });
+            continue;
         }
         if path
             .ancestors()
             .take_while(|part| *part != root)
             .any(Path::is_symlink)
         {
-            return Err(format!("symlink output conflict: {relative}"));
+            conflicts.push(SyncConflict {
+                comparison: None,
+                path,
+                error: format!("symlink output conflict: {relative}"),
+                message: "symbolic link · cannot synchronize · not followed",
+            });
+            continue;
         }
+        let mut comparison = None;
+        let mut recovery = None;
         let action = if path.exists() {
-            let current =
-                fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let current = match fs::read_to_string(&path) {
+                Ok(current) => current,
+                Err(error) => {
+                    conflicts.push(SyncConflict {
+                        comparison: None,
+                        error: format!("{}: {error}", path.display()),
+                        path,
+                        message: "cannot read file · synchronization not checked",
+                    });
+                    continue;
+                }
+            };
+            if current != content {
+                comparison = Some(comparison::compare(&current, &content, &marker));
+            }
             let valid = match marker.as_str() {
                 "hash" => is_owned_comment(&current),
                 "jsonc" => is_owned_slash_comment(&current),
                 "json" => is_owned_json(&current),
                 _ => is_owned(&current, ""),
             };
-            if !valid {
-                return Err(format!("unowned or modified output conflict: {relative}"));
+            if !valid && projection_backup::has_marker(&current, &marker) {
+                recovery = Some(projection_backup::Backup::plan(
+                    root,
+                    &path,
+                    current.clone(),
+                )?);
+            } else if !valid {
+                conflicts.push(SyncConflict {
+                    comparison,
+                    path,
+                    error: format!("unowned or modified output conflict: {relative}"),
+                    message: if claims_rai_ownership(&current) {
+                        "modified locally · rai ownership check failed · not overwritten"
+                    } else {
+                        "not owned by rai · cannot synchronize · not overwritten"
+                    },
+                });
+                continue;
             }
             if current == content {
                 Action::Unchanged
@@ -602,6 +1481,8 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
             Action::Create
         };
         changes.push(Change {
+            recovery,
+            comparison,
             path,
             content,
             action,
@@ -610,17 +1491,18 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
 
     {
         let agents_dir = root.join(".codex/agents");
-        if agents_dir.is_symlink() {
-            return Err("symlink output conflict: .codex/agents".into());
-        }
-        if agents_dir.is_dir() {
+        if output_has_symlink(root, &agents_dir) {
+            add_symlink_conflict(root, &agents_dir, conflicts);
+        } else if agents_dir.is_dir() {
             for entry in fs::read_dir(&agents_dir).map_err(|e| e.to_string())? {
                 let path = entry.map_err(|e| e.to_string())?.path();
                 if path.is_symlink() {
-                    return Err(format!("symlink output conflict: {}", path.display()));
+                    add_symlink_conflict(root, &path, conflicts);
+                    continue;
                 }
                 if path.extension().is_some_and(|ext| ext == "toml")
                     && !changes.iter().any(|c| c.path == path)
+                    && !conflicts.iter().any(|conflict| conflict.path == path)
                 {
                     let relative = path
                         .strip_prefix(root)
@@ -633,6 +1515,8 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
                     let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
                     if is_owned_comment(&content) {
                         changes.push(Change {
+                            recovery: None,
+                            comparison: None,
                             path,
                             content: String::new(),
                             action: Action::Delete,
@@ -651,16 +1535,21 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         ".claude/skills",
     ] {
         let dir = root.join(directory);
-        if dir.is_symlink() {
-            return Err(format!("symlink output conflict: {directory}"));
+        if output_has_symlink(root, &dir) {
+            add_symlink_conflict(root, &dir, conflicts);
+            continue;
         }
         if dir.is_dir() {
             for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
                 let path = entry.map_err(|e| e.to_string())?.path();
                 if path.is_symlink() {
-                    return Err(format!("symlink output conflict: {}", path.display()));
+                    add_symlink_conflict(root, &path, conflicts);
+                    continue;
                 }
-                if path.is_file() && !changes.iter().any(|change| change.path == path) {
+                if path.is_file()
+                    && !changes.iter().any(|change| change.path == path)
+                    && !conflicts.iter().any(|conflict| conflict.path == path)
+                {
                     let relative = path
                         .strip_prefix(root)
                         .unwrap()
@@ -670,6 +1559,8 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
                         let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
                         if is_owned(&content, "") {
                             changes.push(Change {
+                                recovery: None,
+                                comparison: None,
                                 path: path.clone(),
                                 content: String::new(),
                                 action: Action::Delete,
@@ -679,7 +1570,14 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
                 }
                 if directory == ".claude/skills" && path.is_dir() {
                     let skill = path.join("SKILL.md");
-                    if skill.is_file() && !changes.iter().any(|change| change.path == skill) {
+                    if skill.is_symlink() {
+                        add_symlink_conflict(root, &skill, conflicts);
+                        continue;
+                    }
+                    if skill.is_file()
+                        && !changes.iter().any(|change| change.path == skill)
+                        && !conflicts.iter().any(|conflict| conflict.path == skill)
+                    {
                         let relative = skill
                             .strip_prefix(root)
                             .unwrap()
@@ -689,6 +1587,8 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
                             let content = fs::read_to_string(&skill).map_err(|e| e.to_string())?;
                             if is_owned(&content, "") {
                                 changes.push(Change {
+                                    recovery: None,
+                                    comparison: None,
                                     path: skill,
                                     content: String::new(),
                                     action: Action::Delete,
@@ -715,6 +1615,8 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
             let current = fs::read_to_string(&path).map_err(|e| e.to_string())?;
             if is_owned(&current, prefix) {
                 changes.push(Change {
+                    recovery: None,
+                    comparison: None,
                     path,
                     content: String::new(),
                     action: Action::Delete,
@@ -725,16 +1627,53 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
 
     let ignore_path = root.join(".gitignore");
     if ignore_path.is_symlink() {
-        return Err("symlink output conflict: .gitignore".into());
+        add_symlink_conflict(root, &ignore_path, conflicts);
+        return Ok(plan);
     }
     let old_ignore = if ignore_path.exists() {
-        fs::read_to_string(&ignore_path).map_err(|e| format!(".gitignore: {e}"))?
+        match fs::read_to_string(&ignore_path) {
+            Ok(content) => content,
+            Err(error) => {
+                conflicts.push(SyncConflict {
+                    comparison: None,
+                    path: ignore_path,
+                    error: format!(".gitignore: {error}"),
+                    message: "cannot read ignore entries · synchronization not checked",
+                });
+                return Ok(plan);
+            }
+        }
     } else {
         String::new()
     };
-    for relative in managed_output_paths(&old_ignore)? {
+    let managed = match managed_output_paths(&old_ignore) {
+        Ok(paths) => paths,
+        Err(error) => {
+            conflicts.push(SyncConflict {
+                comparison: None,
+                path: ignore_path,
+                error,
+                message: "invalid rai-managed ignore block · not overwritten",
+            });
+            return Ok(plan);
+        }
+    };
+    for conflict in conflicts.iter_mut() {
+        if conflict.message == "not owned by rai · cannot synchronize · not overwritten"
+            && managed
+                .iter()
+                .any(|relative| root.join(relative) == conflict.path)
+        {
+            conflict.message =
+                "rai-managed path · file or ownership marker changed · not overwritten";
+        }
+    }
+    for relative in managed {
         let path = root.join(&relative);
-        if changes.iter().any(|change| change.path == path) || is_tracked(root, &relative)? {
+        if changes.iter().any(|change| change.path == path)
+            || conflicts.iter().any(|conflict| conflict.path == path)
+            || is_tracked(root, &relative)?
+        {
             continue;
         }
         if path
@@ -752,23 +1691,37 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
             || is_owned_json(&content)
         {
             changes.push(Change {
+                recovery: None,
+                comparison: None,
                 path,
                 content: String::new(),
                 action: Action::Delete,
             });
+        } else {
+            conflicts.push(SyncConflict {
+                comparison: None,
+                path,
+                error: format!("unowned or modified output conflict: {relative}"),
+                message: "obsolete rai-managed path · file or ownership marker changed · not removed",
+            });
         }
     }
     if git_root(root).is_none() {
-        return Ok(changes);
+        return Ok(plan);
     }
 
-    let paths = changes
-        .iter()
-        .filter(|change| change.action != Action::Delete)
-        .filter_map(|change| change.path.strip_prefix(root).ok())
-        .map(|path| path.to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    let new_ignore = update_ignore_paths(&old_ignore, &paths)?;
+    let new_ignore = match update_ignore_paths(&old_ignore, &output_paths) {
+        Ok(content) => content,
+        Err(error) => {
+            conflicts.push(SyncConflict {
+                comparison: None,
+                path: ignore_path,
+                error,
+                message: "invalid rai-managed ignore block · not overwritten",
+            });
+            return Ok(plan);
+        }
+    };
     let ignore_action = if old_ignore == new_ignore {
         Action::Unchanged
     } else if ignore_path.exists() {
@@ -777,12 +1730,101 @@ fn plan_sync(root: &Path) -> Result<Vec<Change>, String> {
         Action::Create
     };
     changes.push(Change {
+        recovery: None,
+        comparison: ignore_path
+            .exists()
+            .then_some(())
+            .filter(|_| old_ignore != new_ignore)
+            .map(|_| comparison::compare(&old_ignore, &new_ignore, "gitignore")),
         path: ignore_path,
         content: new_ignore,
         action: ignore_action,
     });
 
-    Ok(changes)
+    Ok(plan)
+}
+
+fn add_symlink_conflict(root: &Path, path: &Path, conflicts: &mut Vec<SyncConflict>) {
+    if !conflicts.iter().any(|conflict| conflict.path == path) {
+        conflicts.push(SyncConflict {
+            comparison: None,
+            path: path.to_owned(),
+            error: format!(
+                "symlink output conflict: {}",
+                path.strip_prefix(root).unwrap().display()
+            ),
+            message: "symbolic link · cannot synchronize · not followed",
+        });
+    }
+}
+
+fn output_has_symlink(root: &Path, path: &Path) -> bool {
+    path.ancestors()
+        .take_while(|part| *part != root)
+        .any(Path::is_symlink)
+}
+
+fn claims_rai_ownership(content: &str) -> bool {
+    content.starts_with(MARKER_START)
+        || content.starts_with("# rai-generated sha256:")
+        || content.starts_with("// rai-generated sha256:")
+        || content.contains("\"_rai_generated_sha256\"")
+}
+
+fn has_modified_native_projection(root: &Path, native: &[String]) -> Result<bool, String> {
+    if native.is_empty() {
+        return Ok(false);
+    }
+    let ignore = root.join(".gitignore");
+    let managed = if ignore.is_file() && !ignore.is_symlink() {
+        fs::read_to_string(ignore)
+            .ok()
+            .and_then(|content| managed_output_paths(&content).ok())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    for relative in native {
+        let mut path = root.join(relative);
+        if path
+            .ancestors()
+            .take_while(|part| *part != root)
+            .any(Path::is_symlink)
+        {
+            continue;
+        }
+        if path.is_dir() {
+            path = path.join("SKILL.md");
+        }
+        if path.is_file() && !path.is_symlink() {
+            let content =
+                fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            let recorded_path = managed.iter().any(|relative| root.join(relative) == path);
+            let pending_import = if recorded_path
+                && !claims_rai_ownership(&content)
+                && is_tracked(root, relative)?
+            {
+                if let Some(backup) = existing_migration_backup(root)? {
+                    let manifest = read_migration_manifest(&backup, root)?;
+                    manifest["sources"].as_array().is_some_and(|sources| {
+                        sources
+                            .iter()
+                            .any(|source| source["path"].as_str() == Some(relative))
+                    })
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            let previously_managed =
+                claims_rai_ownership(&content) || (recorded_path && !pending_import);
+            if previously_managed && !owned_native_file(&path)? {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn init(start: &Path) -> Result<(), String> {
@@ -1311,7 +2353,7 @@ fn finish_migration(root: &Path, confirm: bool) -> Result<bool, String> {
         let removed = Command::new("git")
             .args(["rm", "--cached", "-q", "--", relative])
             .current_dir(root)
-            .status()
+            .logged_status()
             .map_err(|e| e.to_string())?;
         if !removed.success() {
             return Err(format!(
@@ -1878,7 +2920,15 @@ fn inspect_doctor(root: &Path) -> (Vec<DoctorIssue>, Vec<Change>) {
 }
 
 fn solution_for_plan_error(error: &str) -> String {
-    if error.contains("unsupported rule name:") {
+    if error.contains("Codex target needs")
+        || error.contains("Codex CLI")
+        || error.contains("Codex version")
+        || error.contains("codex --version")
+    {
+        "Run codex --version. Install or update Codex to at least 0.152.1 and ensure that executable is on PATH, then rerun rai sync.".into()
+    } else if error.starts_with("no .agents/ directory found") {
+        "Run rai sync manually in the intended project (without --dry-run or --json) to initialize .agents/, then add your shared resources there.".into()
+    } else if error.contains("unsupported rule name:") {
         "Set the rule's name to its original instruction filename: AGENTS.md, CLAUDE.md, or copilot-instructions.md. Use path to select its repository directory.".into()
     } else if error.starts_with("tracked output conflict:") {
         "Review and move the tracked instructions into .agents/rules/, then remove the native file from Git tracking before running rai sync. Adding .gitignore alone will not untrack it.".into()
@@ -1892,6 +2942,8 @@ fn solution_for_plan_error(error: &str) -> String {
         "Repair the RosettAI start/end markers in the root .gitignore, then rerun rai sync.".into()
     } else if error.contains("symlink") {
         "Review the symlink target and replace the symlink with a regular source or output path before syncing.".into()
+    } else if error.contains("Permission denied") || error.contains("Access is denied") {
+        "Check read/write access to the reported file and its parent directory. Back up existing configuration before changing permissions, then rerun rai sync --dry-run.".into()
     } else {
         "Review the reported path and .agents/rules/ source, fix the validation error, then rerun rai doctor.".into()
     }
@@ -2038,14 +3090,16 @@ fn doctor(root: &Path, json: bool) -> Result<(), String> {
 fn inspect_doctor_with_progress(root: &Path) -> Result<(Vec<DoctorIssue>, Vec<Change>), String> {
     std::thread::scope(|scope| {
         let (stop, receiver) = std::sync::mpsc::channel::<()>();
+        let inherit_output = command_log::inherit_output();
         let progress = scope.spawn(move || -> io::Result<()> {
+            let _output_scope = inherit_output();
             let mut step = terminal::Step::new("Running diagnostics", true);
             loop {
-                step.tick(&mut io::stdout().lock())?;
+                step.tick(&mut command_log::stdout())?;
                 if receiver.recv_timeout(terminal::FRAME_INTERVAL)
                     != Err(std::sync::mpsc::RecvTimeoutError::Timeout)
                 {
-                    return step.finish(&mut io::stdout().lock(), true);
+                    return step.finish(&mut command_log::stdout(), true);
                 }
             }
         });
@@ -2060,9 +3114,9 @@ fn inspect_doctor_with_progress(root: &Path) -> Result<(Vec<DoctorIssue>, Vec<Ch
 }
 
 fn print_doctor_report(root: &Path, issues: &[DoctorIssue]) -> Result<(), String> {
-    let mut out = io::stdout().lock();
+    let mut out = command_log::stdout();
     let color = out.is_terminal();
-    let render = |out: &mut std::io::StdoutLock<'_>| -> io::Result<()> {
+    let render = |out: &mut command_log::Output<std::io::StdoutLock<'_>>| -> io::Result<()> {
         writeln!(
             out,
             "\n  {}\n",
@@ -2264,10 +3318,17 @@ fn print_changes_array(root: &Path, changes: &[Change]) {
             Action::Unchanged => "unchanged",
         };
         print!(
-            "{{\"path\":{},\"action\":{}}}",
+            "{{\"path\":{},\"action\":{}",
             json_string(&path),
             json_string(action)
         );
+        if let Some(backup) = &change.recovery {
+            print!(
+                ",\"backup\":{}",
+                json_string(&backup.path.to_string_lossy())
+            );
+        }
+        print!("}}");
     }
     print!("]");
 }
@@ -2578,6 +3639,16 @@ fn update_ignore_paths(old: &str, paths: &[String]) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn command_suggestions_require_a_close_unique_match() {
+        assert_eq!(super::suggest_command("syn"), Some("sync"));
+        assert_eq!(super::suggest_command("instal"), Some("install"));
+        assert_eq!(super::suggest_command("unknown"), None);
+        assert_eq!(super::suggest_command("in"), None);
+        assert_eq!(super::suggest_command("watch"), None);
+        assert_eq!(super::suggest_command(""), None);
+    }
+
     use super::*;
     use tempfile::TempDir;
 
@@ -2835,7 +3906,7 @@ mod tests {
     }
 
     #[test]
-    fn edited_projection_is_not_overwritten() {
+    fn edited_projection_is_planned_for_backup_and_resynchronization() {
         let dir = repo();
         sync(dir.path(), false).unwrap();
         let path = dir.path().join(CODEX);
@@ -2844,8 +3915,14 @@ mod tests {
             format!("{}manual edit\n", fs::read_to_string(&path).unwrap()),
         )
         .unwrap();
-        let error = sync(dir.path(), false).unwrap_err();
-        assert!(error.contains("modified"));
+        let changes = plan_sync(&dir.path().canonicalize().unwrap()).unwrap();
+        let change = changes
+            .iter()
+            .find(|change| change.path.ends_with(CODEX))
+            .unwrap();
+        assert_eq!(change.action, Action::Update);
+        assert!(change.recovery.is_some());
+        assert!(!change.content.contains("manual edit"));
         assert!(fs::read_to_string(path).unwrap().contains("manual edit"));
     }
 

@@ -1,6 +1,6 @@
 # `rai` CLI workflow
 
-Run `rai` in a terminal for an English-language interactive helper. It offers project configuration, synchronization, diagnosis, and machine management. Run `rai help` for the command list. When stdin is non-interactive, `rai` prints the same help instead of waiting for input. Direct commands remain available for scripts and experienced users.
+Run `rai` in a terminal for an English-language interactive helper. It offers project configuration, synchronization, diagnosis, and machine management. Run `rai help` for the command list. When stdin is non-interactive, `rai` prints the same help instead of waiting for input. Direct commands remain available for scripts and experienced users. A mistyped command such as `rai syn` suggests the nearest command when the match is unambiguous. In a terminal, it offers to run that command with the original options after an explicit `y` or `yes`; Enter or EOF cancels. Non-interactive, JSON, and hook invocations only display the suggestion.
 
 `rai` is the local command-line interface for RosettAI. The Rust proof of concept implements `install`, `uninstall`, `init`, `migrate`, `rollback`, `status`, `sync`, `doctor`, and a Codex prompt guard. A team versions its configuration in `.agents/`, while RosettAI projects rules, subagents, skills, and MCP to Codex, Claude Code, and GitHub Copilot Desktop.
 
@@ -13,7 +13,7 @@ Install the CLI with `cargo install --path .`, then run `rai install` once to en
 3. **Change shared configuration:** edit Markdown files directly in `.agents/rules/` and commit those source files. Add `path: frontend` in a rule's `---` frontmatter to project it to `frontend/AGENTS.md` when `frontend/` exists; omit the field for a global rule. The watcher or hooks update generated files after local edits and Git operations. Scoped native-rule import is not implemented yet.
 4. **Check the result if needed:** run `rai status` from anywhere in the repository. It reports whether the Codex projections need updating or have a conflict; `rai doctor` checks setup and source problems.
 
-For a new repository, the first manual `rai sync` creates `.agents/rules/`, `.agents/subagents/`, and `.agents/skills/`, each with a `.keep` file, plus `.agents/mcp.yaml` containing `servers: {}`. It creates no default rule. The `.keep` files and empty MCP manifest produce no rules, agents, skills, or MCP projections. `rai init` remains available for setup without immediate synchronization and must not replace an existing `.agents/` directory. All repository commands find the nearest `.agents/` by walking upward; `--repo <path>` selects another checkout.
+For a new repository, the first manual `rai sync` creates `.agents/rules/`, `.agents/agents/`, `.agents/commands/`, and `.agents/skills/`, each with a `.keep` file, plus `.agents/mcp.yaml` containing `servers: {}`. It creates no default rule. The `.keep` files and empty MCP manifest produce no rules, agents, skills, or MCP projections. Sync automatically removes regular `.keep` files from subdirectories of `.agents/` that contain another entry, including nested skill directories and legacy `subagents/`. Empty directories retain their placeholders, and symbolic links are neither followed nor removed. These deletions appear in the sync report and JSON; `--dry-run` and `status` only preview them, and a blocked sync leaves them unchanged. `rai init` remains available for setup without immediate synchronization and must not replace an existing `.agents/` directory. All repository commands find the nearest `.agents/` by walking upward; `--repo <path>` selects another checkout.
 
 ## Commands a developer may need
 
@@ -25,9 +25,18 @@ For a new repository, the first manual `rai sync` creates `.agents/rules/`, `.ag
 | `rai rollback` | Restore native instructions from the recorded migration backup. | `--repo <path>` |
 | `rai init` | Create an empty source tree without synchronizing. | `--repo <path>` |
 | `rai status` | See the state of generated configuration and any drift. | `--repo <path>`, `--json` |
-| `rai sync` | Set up an unconfigured project on manual use, then project configuration. Git hooks use a non-interactive mode. | `--repo <path>`, `--dry-run`, `--json`, `--codex-hook` |
+| `rai sync` | Set up an unconfigured project on manual use, then project configuration. Git hooks use a non-interactive mode. | `--repo <path>`, `--dry-run`, `--compact`, `--json`, `--codex-hook` |
 | `rai doctor` | Explain each issue and offer interactive fixes where safe. | `--repo <path>`, `--json` |
 | `rai update` | Download, verify, and install the latest stable CLI release. | None |
+| `rai version` | Show the CLI version and the commit used to build the executable. | `--perf` |
+
+`rai version` (also `rai --version` or `rai -V`) prints the package version and
+the full Git commit SHA embedded at compilation. It works outside a project and
+does not query Git or check for updates at runtime. `(dirty)` means the source
+checkout contained uncommitted changes when compiled. Source archives without
+Git metadata report `commit: unknown`; set `RAI_BUILD_SHA` to the full commit SHA
+at build time to supply provenance for those builds. Already installed binaries
+need to be rebuilt or updated before they support this command.
 
 Run `rai uninstall` to stop the optional watcher and remove RosettAI global hooks. It restores the previous global `core.hooksPath` setting when RosettAI still owns it, and removes any legacy Git template it owns. It leaves workspace roots, repository hooks and generated harness configuration, `.agents/` sources, and the `rai` executable untouched.
 
@@ -45,6 +54,82 @@ Every manual `rai sync` checks for unmanaged root and nested instructions and na
 
 `rai sync` validates canonical sources and destinations before writing; it does not run the interactive `rai doctor` workflow. RosettAI adds only specific generated paths to a marked block in the repository-root `.gitignore` when the project is a Git repository; this may leave a reviewable Git change until the block is committed. An unowned file that is not a supported migration source is reported as a conflict and is never overwritten.
 
+The terminal report starts with the synchronization verdict and counters for
+created, updated, removed, and already synchronized files. It groups outputs by
+agent: Codex, Claude Code, and GitHub Copilot. Project maintenance has its own
+group for `.gitignore`, source placeholders, and other maintenance actions.
+Each entry shows its full repository-relative path and explains its state;
+the report includes planned or removed outputs and does not list unrelated
+project files. Normal entries omit
+ownership labels such as "managed by rai"; warnings retain ownership diagnostics.
+Skills appear as one directory entry per skill, without listing their contents
+or content comparisons. A conflicting skill file remains visible with its warning,
+comparison and repair guidance. Green checks identify rai-managed
+files whose ownership marker is valid and whose contents already match the expected
+projection. Cyan entries identify created or updated files, and yellow entries
+identify obsolete managed files removed during synchronization. A yellow warning
+marks each conflicting file (local edits, missing ownership markers, Git tracking,
+or symbolic links). A conflict no longer stops inspection of the other outputs:
+the same report shows passing files and pending creations, updates, and removals,
+with a summary of synchronized files and warnings. Unowned, tracked, symlinked, unreadable, or invalidly marked outputs still block
+writes; pending actions are displayed as a preview. An active generated projection
+with a syntactically intact rai marker but a changed digest is now automatically
+resynchronized: rai saves its exact local contents outside the repository before
+regenerating it from `.agents/`. All required backups must succeed before any
+project output is replaced. The report shows the comparison, the restored file,
+and its backup path. Local edits are not imported into canonical resources.
+A missing/malformed marker and a modified obsolete output still require review.
+Edited projections are not offered for automatic migration.
+Each warning includes a way to resolve it. For edited or unowned files, the report
+offers two choices: copy intended edits to the matching canonical resources
+(preserving directory scope), then move the native file to a backup outside the
+repository; or use the canonical version after moving the native file aside.
+Tracked outputs include a `git rm --cached` command that keeps the local file
+and stages its removal from Git. Symbolic-link, file-access, and malformed-ignore
+warnings have specific repair guidance. The report gives commands to preview and
+rerun sync after the warnings are resolved. Suggestions are never executed by
+the report. Failed sync commands also point to `rai doctor` for guided diagnosis;
+validation failures include a suggested repair. JSON output stays structured and
+does not include the terminal guidance. An update requiring preservation has a
+`backup` path in its change object; with `--dry-run` this is a planned path and no
+backup or output is written. On successful sync the backup exists. Backups live
+under `~/.rai/projection-backups/` (or the configured XDG directory on Unix,
+`%APPDATA%\rai\projection-backups\` on Windows), grouped by repository and local
+content digest, preserving the native relative path. They are kept for manual
+review; repeated clean syncs create no further backup.
+Only when a local file differs from its expected projection and both are readable, the report
+also compares their contents and shows a similarity percentage plus the number
+of local lines added and removed relative to the expected output. Similarity is
+`2 × matching lines / (local lines + expected lines)`, with matching lines counted
+in order. Ownership digest headers are excluded; valid JSON has its ownership
+metadata removed and is formatted consistently before comparison. Invalid JSON
+falls back to raw text comparison. Line endings and
+the final newline do not affect this line-based comparison. A successful update
+labels the comparison as "before sync". A 100% content match does not override an
+ownership or Git-tracking conflict. Missing files, symbolic links and unreadable
+files and obsolete outputs have no percentage; unusually large differences report that comparison is
+unavailable instead of inventing a result.
+For `.gitignore`,
+the report refers specifically to the rai-managed ignore entries. The verdict
+states whether any files changed. `--dry-run` describes proposed actions without
+writing; `--json` retains its structured action names and includes no styling.
+
+Use `rai sync --compact` for a compact receipt: it hides unchanged file entries
+while retaining their count, all changed and pending paths, diagnostics,
+comparisons, repair guidance, and backup paths. A blocked sync still explains
+its conflicts and reports that no files changed. When everything is already
+synchronized, the receipt shows the verdict and unchanged count without listing
+each file. `--compact` affects only presentation, not synchronization behavior.
+It is valid only with `sync` and can be combined with `--dry-run`, `--json`,
+and hook modes. With `--json`, `--compact` is ignored and the JSON output remains
+identical; the Codex hook's structured output also remains unchanged.
+
+```sh
+rai sync --compact
+rai sync --dry-run --compact
+rai sync --json --compact
+```
+
 `rai doctor` groups terminal diagnostics into Project, Synchronization, and Installation.
 It displays green checks for passing groups, red errors for invalid resources or
 unsafe projections, and yellow warnings for drift or incomplete installation.
@@ -54,6 +139,39 @@ Enter an issue number to apply its available fix, `a` to apply all available fix
 `r` to rerun diagnostics, or `q` to exit (then press Enter). Corrections are followed
 by another check. Missing workspace locations retain their separate choice prompt.
 Non-interactive runs never prompt, and `--json` keeps its existing output schema.
+
+## Command logs
+
+Every `rai` invocation writes a transcript outside the project. On Unix the
+default is `~/.rai/logs/`; an explicit `XDG_CONFIG_HOME` uses
+`$XDG_CONFIG_HOME/rai/logs/`. Windows uses `%APPDATA%\rai\logs\`.
+
+Project transcripts live under `logs/projects/<project-name>-<path-sha256>/`.
+The hash identifies the canonical absolute project path, so two projects with
+the same name remain separate, while commands from a subdirectory or a symlink
+to the same project share the same folder. Commands without a project, including
+`install`, `uninstall`, `update`, `help`, `version`, and the watcher process,
+go under `logs/global/`. Git and Codex hook invocations use their project folder.
+Each watcher scan records a separate synchronization for each discovered project,
+including failures and checks that require no changes. Commands selected in the
+interactive helper receive their own transcript, linked to the helper invocation.
+
+Each invocation has a unique UTC timestamp/PID filename ending in `.jsonl`.
+Files contain one JSON object per line: a `start` event with arguments, project,
+working directory, version, PID, and trigger; `output` events with a `stdout` or
+`stderr` stream and text; and a `finish` event with `exitCode`, `durationMs`, and
+an optional error. Output is written as it appears, without accumulating a
+long-running watcher's output in memory. Concurrent commands use distinct files.
+A process killed before completion may leave a transcript without a `finish`
+event; its start and previously written output remain available.
+
+Logging preserves terminal interaction and `--json` output. A logging failure
+prints a warning on stderr and does not fail the command. On Unix, new log
+directories use permissions `0700` and transcript files use `0600`. Existing
+files or symbolic links in place of log directories are preserved and reported.
+Transcripts retain the command arguments and displayed output, but do not record
+stdin answers, hook input payloads, or the environment. Logs are retained until
+you remove them; there is no automatic cleanup.
 
 ## What runs automatically
 
@@ -71,3 +189,29 @@ The generated `.codex/config.toml` declares a `UserPromptSubmit` command hook
 that runs `rai sync --codex-hook`. When synchronization changes files, the hook
 blocks the prompt and asks for a new Codex session. Project configuration and
 the hook must be trusted by Codex before this guard runs. See [Codex workflow](codex.md).
+
+## Generated projection edit guards
+
+Generated Codex configuration registers a `PreToolUse` hook for `apply_patch`,
+`Edit`, and `Write`; generated `.claude/settings.json` registers the same guard
+for `Edit`, `Write`, and `MultiEdit`. They invoke the internal `rai guard` command,
+which reads the harness event from stdin and denies edits, deletion, or moves to
+active generated outputs. The message redirects instruction edits to
+`.agents/rules/`, retaining a scoped rule's `path`; other resources belong under
+`.agents/agents/`, `.agents/skills/`, or `.agents/mcp.yaml` as appropriate. Ordinary
+project files and canonical files remain editable. The guard needs neither Git
+nor a Codex executable and performs no synchronization or network access.
+Running `rai guard` directly in a terminal exits immediately with an explanation
+instead of waiting for hook input.
+
+A digest mismatch identifies an edit after generation; it cannot identify its
+author. Guard decisions identify intercepted agent tool attempts, not the author
+of an existing changed file. The hooks must be enabled and trusted by the harness
+and the installed `rai` must include the guard. Start a new session after updating
+the generated configuration. Arbitrary shell, MCP, or specialized tool writes
+are not comprehensively intercepted; these guards are not an OS sandbox and do
+not prevent a person from editing files in their editor. Subsequent sync preserves
+recognized edited projections in backups and restores canonical contents.
+
+References: [Codex hooks](https://learn.chatgpt.com/docs/hooks) and
+[Claude Code hooks](https://code.claude.com/docs/en/hooks).

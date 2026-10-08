@@ -60,7 +60,7 @@ RosettAI checks the repository-root `.gitignore` before writing a projection. If
 
 Do not ignore the entire `/.codex/` directory merely because RosettAI writes files there: the repository may contain hand-maintained files alongside generated ones. If a proposed output path already exists and is not owned by RosettAI, report a conflict before writing. If Git already tracks that path, adding an ignore rule will not untrack it; report the tracked-output conflict.
 
-RosettAI should record which paths it owns so later syncs can update or remove only its own outputs. `rai status` should show detected harnesses, generated paths, conflicts, and unsupported features.
+RosettAI records generated paths in its managed ignore block. An active projection with an intact rai marker and a changed digest is backed up outside the repository, then regenerated from canonical sources. All necessary backups must succeed before writing outputs. Unowned, tracked, symlinked, and invalidly marked files remain conflicts; modified obsolete files are preserved for review. Integrity hashes detect edits after generation, but cannot distinguish a person from an agent. Generated Codex and Claude Code edit-tool hooks redirect agents to `.agents/`; arbitrary shell writes remain outside that guard. `rai status` should show detected harnesses, generated paths, conflicts, and unsupported features.
 
 ## Native configuration drift
 

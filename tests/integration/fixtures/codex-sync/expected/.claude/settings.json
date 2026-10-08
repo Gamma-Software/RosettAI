@@ -1,0 +1,17 @@
+{
+  "_rai_generated_sha256": "8b5b6495c8f1d7ac107a4815bcba4267725c2dca8628342ffeec7eb358ca6fd7",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "command": "rai guard",
+            "timeout": 10,
+            "type": "command"
+          }
+        ],
+        "matcher": "Edit|Write|MultiEdit"
+      }
+    ]
+  }
+}

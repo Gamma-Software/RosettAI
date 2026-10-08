@@ -6,6 +6,7 @@
 /.codex/config.toml
 /.github/copilot-instructions.md
 /.github/instructions/src.instructions.md
+/.claude/settings.json
 /CLAUDE.md
 /.claude/rules/src.md
 /.claude/skills/integrate-harness/SKILL.md

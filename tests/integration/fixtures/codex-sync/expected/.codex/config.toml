@@ -1,4 +1,4 @@
-# rai-generated sha256:03e808f996b1421bde0e02b6050ba4c8ed1a6d70b472c23c97950d64987d98ea
+# rai-generated sha256:01ca7ae5f5c797d0c570e5996d4df9e902ef4bf0cb4e3d7e3754fbf96e66d74f
 # Codex projection from .agents/ (tested with codex-cli 0.152.1)
 
 [mcp_servers.docs]
@@ -23,3 +23,10 @@ description = "Review changes for correctness and regressions."
 type = "command"
 command = "rai sync --codex-hook"
 timeout = 30
+
+[[hooks.PreToolUse]]
+matcher = "^(apply_patch|Edit|Write)$"
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "rai guard"
+timeout = 10

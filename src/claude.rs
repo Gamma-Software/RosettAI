@@ -7,7 +7,16 @@ pub fn outputs(
     root: &Path,
     rules: &BTreeMap<String, Vec<String>>,
 ) -> Result<Vec<(String, String, String)>, String> {
-    let mut result = Vec::new();
+    let settings = serde_json::to_string_pretty(&json!({"hooks": {"PreToolUse": [{
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [{"type": "command", "command": "rai guard", "timeout": 10}]
+    }]}}))
+    .map_err(|e| e.to_string())?;
+    let mut result = vec![(
+        ".claude/settings.json".into(),
+        format!("{settings}\n"),
+        "json".into(),
+    )];
     for (scope, sections) in rules {
         let body = format!("# Shared project rules\n\n{}\n", sections.join("\n\n"));
         if scope.is_empty() {
@@ -52,6 +61,12 @@ pub fn outputs(
             let name = skill.file_name().unwrap().to_string_lossy();
             for entry in fs::read_dir(&skill).map_err(|e| e.to_string())? {
                 let path = entry.map_err(|e| e.to_string())?.path();
+                if path.file_name().is_some_and(|name| name == ".keep")
+                    && path.is_file()
+                    && !path.is_symlink()
+                {
+                    continue;
+                }
                 if path.file_name().unwrap() != "SKILL.md" {
                     return Err(format!(
                         "Claude projection does not support skill attachment: {}",

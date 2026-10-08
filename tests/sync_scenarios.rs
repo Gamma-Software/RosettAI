@@ -426,7 +426,7 @@ fn rule_metadata_controls_name_and_scope_after_the_source_is_renamed() {
     .unwrap();
     let repeated = case.run(&["sync"], "");
     assert!(repeated.status.success(), "{}", stderr(&repeated));
-    assert!(stdout(&repeated).contains("Unchanged src/AGENTS.md"));
+    assert!(stdout(&repeated).contains("AGENTS.md — already synchronized"));
     assert_eq!(case.read("src/AGENTS.md"), source);
     assert_eq!(case.read("AGENTS.md"), global);
 }
@@ -742,6 +742,156 @@ fn manual_sync_bootstraps_only_the_canonical_skeleton() {
         assert!(!case.repo.join(output).exists(), "{output}");
     }
     assert!(case.run(&["sync"], "").status.success());
+}
+
+#[test]
+fn sync_cleans_populated_canonical_directories_and_previews_without_writes() {
+    for args in [vec!["sync", "--json"], vec!["sync", "--git-hook"]] {
+        let case = Case::new(Some("typed-resources"));
+        let removed = [
+            ".agents/rules/.keep",
+            ".agents/agents/.keep",
+            ".agents/subagents/.keep",
+            ".agents/skills/.keep",
+            ".agents/skills/example/.keep",
+            ".agents/extra/assets/.keep",
+            ".agents/extra/.keep",
+        ];
+        let retained = [
+            ".agents/.keep",
+            ".agents/commands/.keep",
+            ".agents/extra/empty/.keep",
+            "src/.keep",
+        ];
+        for path in removed.iter().chain(&retained) {
+            let path = case.repo.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        fs::write(
+            case.repo.join(".agents/subagents/legacy.md"),
+            "---\nname: legacy\ndescription: Legacy agent\n---\nReview changes.\n",
+        )
+        .unwrap();
+        fs::write(
+            case.repo.join(".agents/skills/example/SKILL.md"),
+            "---\nname: example\ndescription: Example skill\n---\nCheck the assets.\n",
+        )
+        .unwrap();
+        fs::write(case.repo.join(".agents/extra/assets/icon.svg"), "<svg/>\n").unwrap();
+        // Canonical placeholders can be Git-tracked; cleanup must leave the index alone.
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&case.repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["add", ".agents"])
+                .current_dir(&case.repo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let index = fs::read(case.repo.join(".git/index")).unwrap();
+        let rules = case.read(".agents/rules/source.md");
+        for options in [
+            vec!["sync", "--dry-run", "--json"],
+            vec!["status", "--json"],
+        ] {
+            let preview = case.run(&options, "");
+            assert!(preview.status.success(), "{}", stderr(&preview));
+            let value: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
+            for path in removed {
+                assert!(
+                    value["changes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|change| change["path"] == path && change["action"] == "delete")
+                );
+                assert!(case.repo.join(path).is_file());
+            }
+            assert!(!case.repo.join("AGENTS.md").exists());
+        }
+        let preview = case.run(&["sync", "--dry-run"], "");
+        assert!(preview.status.success(), "{}", stderr(&preview));
+        assert!(stdout(&preview).contains("directory is populated · will remove placeholder"));
+        let result = case.run(&args, "");
+        assert!(result.status.success(), "{}", stderr(&result));
+        for path in removed {
+            assert!(!case.repo.join(path).exists(), "{path}");
+        }
+        for path in retained {
+            assert!(case.repo.join(path).is_file(), "{path}");
+        }
+        assert_eq!(case.read(".agents/rules/source.md"), rules);
+        assert!(
+            case.read("src/AGENTS.md")
+                .contains("Scoped source instructions.")
+        );
+        assert!(
+            !case
+                .read("AGENTS.md")
+                .contains("Scoped source instructions.")
+        );
+        assert_eq!(case.read(".agents/extra/assets/icon.svg"), "<svg/>\n");
+        assert_eq!(fs::read(case.repo.join(".git/index")).unwrap(), index);
+        let repeated = case.run(&["sync", "--json"], "");
+        assert!(repeated.status.success(), "{}", stderr(&repeated));
+        let value: serde_json::Value = serde_json::from_str(&stdout(&repeated)).unwrap();
+        assert!(
+            value["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|change| change["action"] == "unchanged")
+        );
+    }
+}
+
+#[test]
+fn blocked_sync_preserves_canonical_placeholders() {
+    let case = Case::new(Some("typed-resources"));
+    assert!(case.run(&["sync"], "").status.success());
+    let keep = case.repo.join(".agents/rules/.keep");
+    fs::write(&keep, "").unwrap();
+    fs::write(case.repo.join(".codex/config.toml"), "user configuration\n").unwrap();
+    let result = case.run(&["sync", "--json"], "");
+    assert!(!result.status.success());
+    assert!(keep.is_file());
+    assert_eq!(case.read(".codex/config.toml"), "user configuration\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn placeholder_cleanup_preserves_symlinks_and_directories_named_keep() {
+    use std::os::unix::fs::symlink;
+
+    let case = Case::new(Some("typed-resources"));
+    let outside = case.home.path().join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join(".keep"), "").unwrap();
+    fs::write(outside.join("data"), "preserve\n").unwrap();
+    let extra = case.repo.join(".agents/extra");
+    fs::create_dir_all(extra.join("directory/.keep")).unwrap();
+    fs::write(extra.join("directory/data"), "preserve\n").unwrap();
+    fs::write(extra.join("data"), "preserve\n").unwrap();
+    symlink(&outside, extra.join("linked-directory")).unwrap();
+    symlink(outside.join(".keep"), extra.join(".keep")).unwrap();
+    let result = case.run(&["sync", "--json"], "");
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert!(extra.join(".keep").is_symlink());
+    assert!(extra.join("linked-directory").is_symlink());
+    assert!(extra.join("directory/.keep").is_dir());
+    assert!(outside.join(".keep").is_file());
+    assert_eq!(
+        fs::read_to_string(outside.join("data")).unwrap(),
+        "preserve\n"
+    );
 }
 
 #[test]
@@ -1097,7 +1247,7 @@ fn existing_canonical_sources_sync_and_remain_idempotent() {
     let second = case.run(&["sync", "--git-hook"], "");
     assert!(second.status.success(), "{}", stderr(&second));
     assert!(!stdout(&second).contains("Migration proposed"));
-    assert!(stdout(&second).contains("Unchanged AGENTS.md"));
+    assert!(stdout(&second).contains("AGENTS.md — already synchronized"));
 }
 
 #[test]
@@ -1219,8 +1369,7 @@ fn typed_resources_project_all_adapters_and_preserve_scope() {
     assert!(case.repo.join(".github/agents/reviewer.agent.md").exists());
     let repeated = case.run(&["sync"], "");
     assert!(repeated.status.success(), "{}", stderr(&repeated));
-    assert!(!stdout(&repeated).contains("Update "));
-    assert!(!stdout(&repeated).contains("Create "));
+    assert!(stdout(&repeated).contains("Everything is synchronized. No files changed."));
 }
 
 #[test]

@@ -285,11 +285,18 @@ fn copilot_collisions_abort_before_any_projection_is_written() {
 }
 
 #[test]
-fn modified_copilot_projection_is_never_overwritten() {
+fn modified_copilot_projection_without_marker_is_preserved() {
     let repo = repo();
     ok(repo.path(), &["sync"]);
     let path = repo.path().join(".github/copilot-instructions.md");
-    let edited = format!("{}Local edit.\n", fs::read_to_string(&path).unwrap());
+    let edited = format!(
+        "{}Local edit.\n",
+        fs::read_to_string(&path)
+            .unwrap()
+            .split_once('\n')
+            .unwrap()
+            .1
+    );
     fs::write(&path, &edited).unwrap();
     fs::write(
         repo.path().join(".agents/rules/general.md"),
@@ -300,7 +307,7 @@ fn modified_copilot_projection_is_never_overwritten() {
     failed(
         repo.path(),
         &["sync", "--git-hook"],
-        "unmanaged native configuration",
+        "unowned or modified output conflict: .github/copilot-instructions.md",
     );
     assert_eq!(fs::read_to_string(path).unwrap(), edited);
 }

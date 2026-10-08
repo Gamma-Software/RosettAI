@@ -54,9 +54,17 @@ cargo run -- sync --repo /path/to/test-repo
 cargo test
 ```
 
-The command generates Codex `AGENTS.md`/TOML files, Claude Code `CLAUDE.md`/`.claude`/`.mcp.json` files, and Copilot Desktop `.github` instruction/agent files plus `.vscode/mcp.json`, then adds exact output paths to the repository-root `.gitignore`. Rules stay directly in `.agents/rules/`; subagents use Markdown with YAML frontmatter in `.agents/subagents/`, and MCP declarations use `.agents/mcp.yaml`. See the [Codex workflow](docs/codex.md), [Claude Code adapter](docs/claude.md), and [Copilot Desktop workflow](docs/copilot-desktop.md). It refuses to replace existing unowned, modified, or Git-tracked outputs.
+The command generates Codex `AGENTS.md`/TOML files, Claude Code `CLAUDE.md`/`.claude`/`.mcp.json` files, and Copilot Desktop `.github` instruction/agent files plus `.vscode/mcp.json`, then adds exact output paths to the repository-root `.gitignore`. Rules stay directly in `.agents/rules/`; subagents use Markdown with YAML frontmatter in `.agents/subagents/`, and MCP declarations use `.agents/mcp.yaml`. See the [Codex workflow](docs/codex.md), [Claude Code adapter](docs/claude.md), and [Copilot Desktop workflow](docs/copilot-desktop.md). It preserves unowned, Git-tracked, or symlinked outputs. Modified active rai projections with an intact ownership marker are backed up outside the repository before regeneration. Generated Codex and Claude Code hooks block direct edits through supported editing tools and redirect agents to `.agents/`.
 
 Run `cargo install --path .` to build and install `rai` from this checkout. Then `rai sync` creates an empty `.agents/` source tree on first manual use and synchronizes it. `rai status` previews drift, and `rai doctor` reports configuration problems. `rai install` sets up global Git hooks once for existing repositories and future clones. `rai install --root /path/to/workspace` additionally registers a directory for polling and installs a per-user watcher through launchd on macOS, systemd on Linux, or Task Scheduler on Windows. Setup is not run automatically by installation.
+
+The sync report starts with its verdict and file counts, then groups full
+repository-relative paths under Codex, Claude Code, GitHub Copilot, and Project
+maintenance. Use `rai sync --compact` for a compact receipt that hides unchanged
+file entries while keeping their count, diagnostics, comparisons, and backup
+paths. Combine it with `--dry-run` to preview changes. `--compact` is only valid
+with `sync`; it is accepted with hook modes and ignored with `--json`, whose
+output stays unchanged. See the [sync report details](docs/cli.md#commands-a-developer-may-need).
 
 Every normal command warns at the end when a newer stable GitHub Release is available, using a one-hour cache. The check requires `curl` and a network connection.
 
@@ -65,6 +73,11 @@ Run `rai update` to download and install the latest stable CLI release. It verif
 In a terminal, `rai doctor` proposes a solution for each issue and lets you apply one safe fix or all available safe fixes. Unmanaged native files still require manual review; `--json` never prompts.
 
 Add `--perf` to any command (for example, `rai sync --dry-run --perf`) to print only its elapsed time to stderr without changing `--json` output.
+
+Every `rai` invocation saves its command, output, errors, duration, and exit code
+under `~/.rai/logs/` by default. Project commands and automatic synchronizations
+are grouped by project path; machine commands go under `logs/global/`. See the
+[command logging details](docs/cli.md#command-logs) for paths and format.
 
 ## Releases
 

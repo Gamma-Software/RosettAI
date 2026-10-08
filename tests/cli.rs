@@ -4,6 +4,74 @@ use std::process::Command;
 use std::process::Stdio;
 
 #[test]
+fn unknown_command_shows_only_public_commands_without_requiring_a_project() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .arg("unknown")
+        .current_dir(dir.path())
+        .env("PATH", "")
+        .env("XDG_CACHE_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown command: unknown"));
+    assert!(
+        stderr.contains("usage: rai [install|sync|doctor|update|version|uninstall|help] [options]")
+    );
+    assert!(!stderr.contains("no .agents/"));
+    let usage = stderr.lines().find(|line| line.contains("usage:")).unwrap();
+    for legacy in ["init", "migrate", "rollback", "status", "watch"] {
+        assert!(!usage.contains(legacy));
+    }
+}
+
+#[test]
+fn version_reports_build_metadata_without_a_project_or_runtime_git() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_file = dir.path().join("cache/rai/latest-release");
+    fs::create_dir_all(cache_file.parent().unwrap()).unwrap();
+    fs::write(cache_file, "v999.0.0").unwrap();
+    let expected = format!(
+        "rai {}\ncommit: {}{}\n",
+        env!("CARGO_PKG_VERSION"),
+        env!("RAI_BUILD_COMMIT"),
+        if env!("RAI_BUILD_DIRTY") == "true" {
+            " (dirty)"
+        } else {
+            ""
+        }
+    );
+    for command in ["version", "--version", "-V"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_rai"))
+            .arg(command)
+            .current_dir(dir.path())
+            .env("PATH", "")
+            .env("RAI_BUILD_SHA", "runtime-value-must-not-change-the-commit")
+            .env("XDG_CACHE_HOME", dir.path().join("cache"))
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(String::from_utf8(result.stdout).unwrap(), expected);
+        assert!(result.stderr.is_empty());
+    }
+    assert!(!dir.path().join(".agents").exists());
+}
+
+#[test]
+fn version_rejects_project_options() {
+    let result = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["version", "--repo", "/nonexistent"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("version accepts only --perf"));
+}
+
+#[test]
 fn first_manual_sync_creates_empty_canonical_tree_but_git_hook_does_not() {
     let repo = tempfile::tempdir().unwrap();
     let invoke = |args: &[&str]| {
@@ -615,6 +683,7 @@ fn help_works_without_a_project_and_without_ansi_when_piped() {
             .args(args)
             .current_dir(dir.path())
             .env("XDG_CACHE_HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path().join("config"))
             .output()
             .unwrap();
         assert!(result.status.success());
@@ -807,7 +876,7 @@ fn cli_dry_run_then_sync_then_noop() {
 
     let preview = invoke(true);
     assert!(preview.status.success());
-    assert!(String::from_utf8_lossy(&preview.stdout).contains("Create AGENTS.md"));
+    assert!(String::from_utf8_lossy(&preview.stdout).contains("AGENTS.md — will create"));
     assert!(!repo.path().join("AGENTS.md").exists());
 
     let first = invoke(false);
@@ -817,7 +886,1115 @@ fn cli_dry_run_then_sync_then_noop() {
 
     let second = invoke(false);
     assert!(second.status.success());
-    assert!(String::from_utf8_lossy(&second.stdout).contains("Unchanged AGENTS.md"));
+    assert!(String::from_utf8_lossy(&second.stdout).contains("AGENTS.md — already synchronized"));
+}
+
+#[test]
+fn sync_explains_owned_files_and_the_managed_gitignore_block() {
+    let repo = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let git_config = config.path().join("gitconfig");
+    fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
+    let rule = repo.path().join(".agents/rules/general.md");
+    fs::write(&rule, "Shared instruction.\n").unwrap();
+    fs::create_dir(repo.path().join("frontend")).unwrap();
+    fs::write(
+        repo.path().join(".agents/rules/scoped.md"),
+        "---\npath: frontend\n---\nFrontend instruction.\n",
+    )
+    .unwrap();
+    for name in ["first", "second"] {
+        let directory = repo.path().join(".agents/skills").join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!("---\nname: {name}\ndescription: Test skill\n---\nShared skill instruction.\n"),
+        )
+        .unwrap();
+    }
+    fs::write(
+        repo.path().join("user-note.txt"),
+        "Keep this note outside the sync report.",
+    )
+    .unwrap();
+    fs::write(repo.path().join(".gitignore"), "user-cache/\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .env("GIT_CONFIG_GLOBAL", &git_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let invoke = |args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+            .arg("sync")
+            .args(args)
+            .arg("--repo")
+            .arg(repo.path())
+            .env("GIT_CONFIG_GLOBAL", &git_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("XDG_CACHE_HOME", config.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let preview = invoke(&["--dry-run"]);
+    let groups = [
+        "Codex",
+        "Claude Code",
+        "GitHub Copilot",
+        "Project maintenance",
+    ];
+    let positions = groups.map(|group| preview.find(group).expect("agent group in report"));
+    assert!(
+        positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "{preview}"
+    );
+    assert!(
+        !preview.contains('├') && !preview.contains('└'),
+        "{preview}"
+    );
+    assert!(preview.contains("+ .claude/skills/first/ — will create"));
+    assert!(preview.contains("+ .claude/skills/second/ — will create"));
+    let claude = &preview[positions[1]..positions[2]];
+    assert!(claude.contains("CLAUDE.md — will create"), "{claude}");
+    assert!(
+        claude.contains(".claude/rules/frontend.md — will create"),
+        "{claude}"
+    );
+    let codex = &preview[positions[0]..positions[1]];
+    assert!(
+        codex.contains("frontend/AGENTS.md — will create"),
+        "{codex}"
+    );
+    assert!(
+        codex.contains(".codex/config.toml — will create"),
+        "{codex}"
+    );
+    let copilot = &preview[positions[2]..positions[3]];
+    assert!(
+        copilot.contains(".github/copilot-instructions.md — will create"),
+        "{copilot}"
+    );
+    assert!(preview[positions[3]..].contains(".gitignore — will update ignore entries"));
+    assert!(!preview.contains("SKILL.md"));
+    assert!(!preview.contains("managed by rai"));
+    assert!(!preview.contains("rai-managed"));
+    assert!(preview.contains("frontend/AGENTS.md — will create"));
+    assert!(!preview.contains("user-note.txt"));
+    assert!(!repo.path().join("frontend/AGENTS.md").exists());
+    assert!(preview.contains("AGENTS.md — will create"));
+    assert!(preview.contains(".gitignore — will update ignore entries"));
+    assert!(preview.contains("dry-run: no files written"));
+    assert!(!repo.path().join("AGENTS.md").exists());
+    assert_eq!(
+        fs::read_to_string(repo.path().join(".gitignore")).unwrap(),
+        "user-cache/\n"
+    );
+    let created = invoke(&[]);
+    assert!(created.contains("AGENTS.md — created"));
+    assert!(created.contains(".gitignore — ignore entries updated"));
+    assert!(created.contains(".claude/skills/first/ — created"));
+    assert!(!created.contains("SKILL.md"));
+    assert!(!created.contains("will create"));
+    assert!(!created.contains('\u{1b}'));
+    let content = fs::read(repo.path().join("AGENTS.md")).unwrap();
+    let repeated = invoke(&[]);
+    assert!(repeated.contains("AGENTS.md — already synchronized"));
+    assert!(repeated.contains(".gitignore — ignore entries already synchronized"));
+    assert!(repeated.contains("Everything is synchronized. No files changed."));
+    assert!(!repeated.contains("local ↔ expected:"));
+    assert!(repeated.contains("✓ .claude/skills/first/ — already synchronized"));
+    assert!(!repeated.contains("SKILL.md"));
+    assert_eq!(fs::read(repo.path().join("AGENTS.md")).unwrap(), content);
+    fs::write(&rule, "Updated shared instruction.\n").unwrap();
+    let updated = invoke(&[]);
+    assert!(updated.contains("AGENTS.md — updated from .agents/"));
+    assert!(updated.contains("before sync · local ↔ expected:"));
+    assert!(
+        fs::read_to_string(repo.path().join("AGENTS.md"))
+            .unwrap()
+            .contains("Updated shared instruction.")
+    );
+    assert!(
+        fs::read_to_string(repo.path().join(".gitignore"))
+            .unwrap()
+            .starts_with("user-cache/\n")
+    );
+    let skill_source = repo.path().join(".agents/skills/first/SKILL.md");
+    let skill_text = fs::read_to_string(&skill_source).unwrap();
+    fs::write(
+        &skill_source,
+        format!("{skill_text}New skill instruction.\n"),
+    )
+    .unwrap();
+    let preview = invoke(&["--dry-run"]);
+    assert!(preview.contains("↻ .claude/skills/first/ — will update from .agents/"));
+    assert!(!preview.contains("SKILL.md"));
+    assert!(!preview.contains("local ↔ expected:"));
+    let updated = invoke(&[]);
+    assert!(updated.contains("↻ .claude/skills/first/ — updated from .agents/"));
+    assert!(!updated.contains("SKILL.md"));
+    assert!(!updated.contains("local ↔ expected:"));
+
+    let projection = repo.path().join(".claude/skills/first/SKILL.md");
+    let edited = format!(
+        "{}Local skill edit.\n",
+        fs::read_to_string(&projection)
+            .unwrap()
+            .replace("rai-generated sha256:", "rai-generated sha256:invalid-")
+    );
+    fs::write(&projection, &edited).unwrap();
+    let blocked = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["sync", "--dry-run", "--repo"])
+        .arg(repo.path())
+        .env("GIT_CONFIG_GLOBAL", &git_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("XDG_CONFIG_HOME", config.path())
+        .env("XDG_CACHE_HOME", config.path())
+        .output()
+        .unwrap();
+    assert!(!blocked.status.success());
+    let report = String::from_utf8_lossy(&blocked.stdout);
+    assert!(!report.contains(".claude/skills/first/ —"), "{report}");
+    assert!(
+        report.contains(
+            "⚠ .claude/skills/first/SKILL.md — modified locally · rai ownership check failed · not overwritten"
+        ),
+        "{report}"
+    );
+    assert!(report.contains("local ↔ expected:"), "{report}");
+    assert!(
+        report.contains(".agents/skills/ in the matching skill"),
+        "{report}"
+    );
+    assert!(
+        report.contains("✓ .claude/skills/second/ — already synchronized"),
+        "{report}"
+    );
+    assert_eq!(report.matches("SKILL.md —").count(), 1, "{report}");
+    assert_eq!(fs::read_to_string(&projection).unwrap(), edited);
+}
+
+#[test]
+fn sync_reports_all_conflicts_and_healthy_files_without_partial_writes() {
+    let repo = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let git_config = config.path().join("gitconfig");
+    fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
+    fs::create_dir(repo.path().join("frontend")).unwrap();
+    fs::write(
+        repo.path().join(".agents/rules/general.md"),
+        "Global rule.\n",
+    )
+    .unwrap();
+    let scoped = repo.path().join(".agents/rules/frontend.md");
+    fs::write(&scoped, "---\npath: frontend\n---\nFrontend rule.\n").unwrap();
+    let skill = repo.path().join(".agents/skills/obsolete/SKILL.md");
+    fs::create_dir_all(skill.parent().unwrap()).unwrap();
+    fs::write(
+        &skill,
+        "---\nname: obsolete\ndescription: Test skill\n---\nSkill instruction.\n",
+    )
+    .unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .env("GIT_CONFIG_GLOBAL", &git_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rai"))
+            .arg("sync")
+            .args(args)
+            .arg("--repo")
+            .arg(repo.path())
+            .env("GIT_CONFIG_GLOBAL", &git_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("XDG_CACHE_HOME", config.path())
+            .output()
+            .unwrap()
+    };
+    assert!(run(&[]).status.success());
+    for relative in ["AGENTS.md", ".codex/config.toml"] {
+        let path = repo.path().join(relative);
+        fs::write(
+            &path,
+            format!(
+                "{}\nLocal edit.\n",
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .split_once('\n')
+                    .unwrap()
+                    .1
+            ),
+        )
+        .unwrap();
+    }
+    let blocked = run(&[]);
+    assert!(!blocked.status.success());
+    let report = String::from_utf8_lossy(&blocked.stdout);
+    assert!(
+        report.contains("✓ .gitignore — ignore entries already synchronized"),
+        "{report}"
+    );
+    assert!(
+        report.contains("2 warning(s); 0 to create, 0 to update, 0 to remove."),
+        "{report}"
+    );
+    assert_eq!(
+        report.matches("local diff: +2 / −0 lines").count(),
+        2,
+        "{report}"
+    );
+    assert_eq!(report.matches("local ↔ expected:").count(), 2, "{report}");
+    assert!(!report.contains("100.0% similar"), "{report}");
+    fs::write(
+        &scoped,
+        "---\npath: frontend\n---\nUpdated frontend rule.\n",
+    )
+    .unwrap();
+    fs::remove_file(repo.path().join("frontend/AGENTS.md")).unwrap();
+    fs::remove_dir_all(skill.parent().unwrap()).unwrap();
+    let preserved = [
+        "AGENTS.md",
+        ".codex/config.toml",
+        "CLAUDE.md",
+        ".claude/rules/frontend.md",
+        ".claude/skills/obsolete/SKILL.md",
+        ".gitignore",
+    ]
+    .map(|relative| (relative, fs::read(repo.path().join(relative)).unwrap()));
+    for args in [&[][..], &["--dry-run"][..], &["--git-hook"][..]] {
+        let output = run(args);
+        assert!(!output.status.success());
+        let report = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            report.contains("Synchronization blocked"),
+            "{report}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            report.contains("⚠ AGENTS.md — rai-managed path"),
+            "{report}"
+        );
+        assert!(
+            report.contains("⚠ .codex/config.toml — rai-managed path"),
+            "{report}"
+        );
+        assert!(
+            report.contains("✓ CLAUDE.md — already synchronized"),
+            "{report}"
+        );
+        assert!(
+            report.contains("+ frontend/AGENTS.md — will create"),
+            "{report}"
+        );
+        assert!(
+            report.contains(".claude/rules/frontend.md — will update from .agents/"),
+            "{report}"
+        );
+        assert!(
+            report.contains(".claude/skills/obsolete/ — obsolete · will remove"),
+            "{report}"
+        );
+        assert!(report.contains("2 warning(s)"), "{report}");
+        assert!(
+            report.contains("Sync blocked. No files changed."),
+            "{report}"
+        );
+        assert!(!report.contains("Migration"), "{report}");
+        assert!(!report.contains("Synchronization complete"), "{report}");
+        assert!(
+            report.contains(
+                "Keep local edits: copy the changes you want into .agents/rules/ (global rules)"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("MCP servers belong in .agents/mcp.yaml"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "Use the canonical version: move 'AGENTS.md' to a backup outside this repository"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("After resolving the warnings, preview: rai sync --repo"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Then synchronize: rai sync --repo"),
+            "{report}"
+        );
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains("For guided diagnosis and available fixes: rai doctor --repo"),
+            "{error}"
+        );
+        assert!(error.contains("output conflict: AGENTS.md"), "{error}");
+        assert!(
+            error.contains("output conflict: .codex/config.toml"),
+            "{error}"
+        );
+    }
+    let output = run(&["--json"]);
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["ok"], false);
+    assert!(json["error"].as_str().unwrap().contains("AGENTS.md"));
+    assert!(
+        json["error"]
+            .as_str()
+            .unwrap()
+            .contains(".codex/config.toml")
+    );
+    for (relative, content) in &preserved {
+        assert_eq!(
+            fs::read(repo.path().join(relative)).unwrap(),
+            *content,
+            "{relative}"
+        );
+    }
+    assert!(!repo.path().join("frontend/AGENTS.md").exists());
+    // Even a removed ownership marker must not turn an edited projection into an import.
+    fs::write(repo.path().join("AGENTS.md"), "Local replacement.\n").unwrap();
+    let output = run(&[]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("AGENTS.md — rai-managed path · file or ownership marker changed")
+    );
+    assert_eq!(
+        fs::read_to_string(repo.path().join("AGENTS.md")).unwrap(),
+        "Local replacement.\n"
+    );
+    let ignore = fs::read_to_string(repo.path().join(".gitignore")).unwrap();
+    fs::write(
+        repo.path().join(".gitignore"),
+        ignore.replace("# End RosettAI generated files", "# Removed end marker"),
+    )
+    .unwrap();
+    let output = run(&["--dry-run"]);
+    assert!(!output.status.success());
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains("⚠ .gitignore — invalid rai-managed ignore block"),
+        "{report}"
+    );
+    assert!(
+        report.contains("✓ CLAUDE.md — already synchronized"),
+        "{report}"
+    );
+    assert!(
+        report.contains("Sync blocked. No files changed."),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "repair the '# RosettAI generated files' and '# End RosettAI generated files' markers"
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("Preserve all ignore rules outside that block."),
+        "{report}"
+    );
+}
+
+struct SyncDisplayFixture {
+    repo: tempfile::TempDir,
+    sandbox: tempfile::TempDir,
+}
+
+impl SyncDisplayFixture {
+    fn new() -> Self {
+        let fixture = Self {
+            repo: tempfile::tempdir().unwrap(),
+            sandbox: tempfile::tempdir().unwrap(),
+        };
+        fs::create_dir_all(fixture.repo.path().join(".agents/rules")).unwrap();
+        fs::create_dir(fixture.repo.path().join("frontend")).unwrap();
+        fs::write(
+            fixture.repo.path().join(".agents/rules/general.md"),
+            "Shared instruction.\n",
+        )
+        .unwrap();
+        fs::write(
+            fixture.repo.path().join(".agents/rules/frontend.md"),
+            "---\npath: frontend\n---\nFrontend instruction.\n",
+        )
+        .unwrap();
+        fs::write(fixture.repo.path().join(".agents/rules/.keep"), "").unwrap();
+        fs::create_dir_all(fixture.sandbox.path().join("home")).unwrap();
+        fs::create_dir_all(fixture.sandbox.path().join("cache/rai")).unwrap();
+        fs::write(
+            fixture.sandbox.path().join("cache/rai/latest-release"),
+            env!("CARGO_PKG_VERSION"),
+        )
+        .unwrap();
+        assert!(fixture.git(&["init", "-q"]).status.success());
+        fixture
+    }
+
+    fn isolated_command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command
+            .current_dir(self.repo.path())
+            .env("HOME", self.sandbox.path().join("home"))
+            .env("XDG_CONFIG_HOME", self.sandbox.path().join("config"))
+            .env("APPDATA", self.sandbox.path().join("config"))
+            .env("XDG_CACHE_HOME", self.sandbox.path().join("cache"))
+            .env("GIT_CONFIG_GLOBAL", self.sandbox.path().join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        self.isolated_command(env!("CARGO_BIN_EXE_rai"))
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    fn git(&self, args: &[&str]) -> std::process::Output {
+        self.isolated_command("git").args(args).output().unwrap()
+    }
+
+    fn files(&self) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn collect(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            files: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            for entry in fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path == root.join(".git") {
+                    continue;
+                }
+                if entry.file_type().unwrap().is_dir() {
+                    collect(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        collect(self.repo.path(), self.repo.path(), &mut files);
+        files
+    }
+}
+
+#[test]
+fn sync_compact_lists_changes_and_counts_unchanged_files_without_agent_groups() {
+    let fixture = SyncDisplayFixture::new();
+    let initial = fixture.run(&["sync"]);
+    assert!(
+        initial.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initial.stderr)
+    );
+    let preview = fixture.run(&["sync", "--dry-run", "--json"]);
+    assert!(preview.status.success());
+    let state: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    let unchanged = state["changes"].as_array().unwrap().len();
+    assert!(unchanged > 0);
+
+    let noop = fixture.run(&["sync", "--compact"]);
+    assert!(
+        noop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&noop.stderr)
+    );
+    let report = String::from_utf8(noop.stdout).unwrap();
+    assert!(report.contains("No files changed."), "{report}");
+    assert!(
+        report.contains(&format!("{unchanged} already synchronized")),
+        "{report}"
+    );
+    assert!(!report.contains(" — already synchronized"), "{report}");
+    assert!(!report.contains(".codex/config.toml"), "{report}");
+    assert!(
+        !report.contains("Claude Code") && !report.contains("GitHub Copilot"),
+        "{report}"
+    );
+
+    fs::write(
+        fixture.repo.path().join(".agents/rules/general.md"),
+        "Updated shared instruction.\n",
+    )
+    .unwrap();
+    let preview = fixture.run(&["sync", "--compact", "--dry-run"]);
+    assert!(preview.status.success());
+    let report = String::from_utf8(preview.stdout).unwrap();
+    assert!(
+        report.contains("AGENTS.md — will update from .agents/"),
+        "{report}"
+    );
+    assert!(
+        report.contains("CLAUDE.md — will update from .agents/"),
+        "{report}"
+    );
+    assert!(
+        report.contains(".github/copilot-instructions.md — will update from .agents/"),
+        "{report}"
+    );
+    assert!(!report.contains(".codex/config.toml"), "{report}");
+    assert!(!report.contains(" — already synchronized"), "{report}");
+    assert!(report.contains("already synchronized"), "{report}");
+}
+
+#[test]
+fn sync_compact_dry_run_preserves_sources_outputs_and_gitignore() {
+    let fixture = SyncDisplayFixture::new();
+    let before = fixture.files();
+    let preview = fixture.run(&["sync", "--compact", "--dry-run"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let report = String::from_utf8(preview.stdout).unwrap();
+    assert!(report.contains("Sync preview"), "{report}");
+    assert!(report.contains("AGENTS.md — will create"), "{report}");
+    assert!(report.contains(".agents/rules/.keep"), "{report}");
+    assert!(report.contains("will remove placeholder"), "{report}");
+    assert!(report.contains("dry-run: no files written"), "{report}");
+    assert!(!report.contains("Synchronization complete"), "{report}");
+    assert_eq!(fixture.files(), before);
+    assert!(!fixture.repo.path().join(".gitignore").exists());
+    assert!(!fixture.repo.path().join("AGENTS.md").exists());
+}
+
+#[test]
+fn sync_compact_tracked_conflict_keeps_diagnostic_solutions_and_blocks_all_changes() {
+    let fixture = SyncDisplayFixture::new();
+    assert!(fixture.run(&["sync"]).status.success());
+    assert!(
+        fixture
+            .git(&["add", "-f", "--", ".codex/config.toml"])
+            .status
+            .success()
+    );
+    fs::write(
+        fixture.repo.path().join(".agents/rules/general.md"),
+        "Pending shared instruction.\n",
+    )
+    .unwrap();
+    let before = fixture.files();
+    let index = fs::read(fixture.repo.path().join(".git/index")).unwrap();
+    for args in [
+        ["sync", "--compact"].as_slice(),
+        ["sync", "--compact", "--dry-run"].as_slice(),
+    ] {
+        let blocked = fixture.run(args);
+        assert!(!blocked.status.success());
+        let report = String::from_utf8(blocked.stdout).unwrap();
+        assert!(report.contains("Synchronization blocked"), "{report}");
+        assert!(
+            report.contains(".codex/config.toml — tracked by Git"),
+            "{report}"
+        );
+        assert!(
+            report.contains("keeps the local file and stages its removal from Git"),
+            "{report}"
+        );
+        assert!(
+            report.contains("rm --cached -- '.codex/config.toml'"),
+            "{report}"
+        );
+        assert!(
+            report.contains("AGENTS.md — will update from .agents/"),
+            "{report}"
+        );
+        assert!(
+            report.contains("Sync blocked. No files changed."),
+            "{report}"
+        );
+        assert!(!report.contains(" — already synchronized"), "{report}");
+        assert!(
+            report.contains("already synchronized") || report.contains(" synchronized,"),
+            "{report}"
+        );
+        assert!(
+            report.contains("After resolving the warnings, preview: rai sync"),
+            "{report}"
+        );
+        assert!(report.contains("Then synchronize: rai sync"), "{report}");
+        assert_eq!(fixture.files(), before);
+        assert_eq!(
+            fs::read(fixture.repo.path().join(".git/index")).unwrap(),
+            index
+        );
+    }
+}
+
+#[test]
+fn sync_compact_json_preserves_structured_changes_and_failure_results() {
+    let fixture = SyncDisplayFixture::new();
+    let before = fixture.files();
+    let full = fixture.run(&["sync", "--dry-run", "--json"]);
+    let compact = fixture.run(&["sync", "--dry-run", "--json", "--compact"]);
+    assert!(full.status.success());
+    assert!(
+        compact.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compact.stderr)
+    );
+    let full: serde_json::Value = serde_json::from_slice(&full.stdout).unwrap();
+    let compact: serde_json::Value = serde_json::from_slice(&compact.stdout).unwrap();
+    assert_eq!(compact, full);
+    assert_eq!(fixture.files(), before);
+    let synced = fixture.run(&["sync", "--json", "--compact"]);
+    assert!(synced.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&synced.stdout).unwrap()["ok"],
+        true
+    );
+    assert!(
+        fixture
+            .git(&["add", "-f", "--", ".codex/config.toml"])
+            .status
+            .success()
+    );
+    let before = fixture.files();
+    let blocked = fixture.run(&["sync", "--json", "--compact"]);
+    assert!(!blocked.status.success());
+    let blocked: serde_json::Value = serde_json::from_slice(&blocked.stdout).unwrap();
+    assert_eq!(blocked["ok"], false);
+    assert!(
+        blocked["error"]
+            .as_str()
+            .unwrap()
+            .contains("tracked output conflict: .codex/config.toml")
+    );
+    assert_eq!(fixture.files(), before);
+}
+
+#[test]
+fn compact_option_is_reserved_for_sync() {
+    let fixture = SyncDisplayFixture::new();
+    let before = fixture.files();
+    for command in [
+        "status",
+        "doctor",
+        "init",
+        "migrate",
+        "rollback",
+        "install",
+        "uninstall",
+        "update",
+        "version",
+        "help",
+    ] {
+        let output = fixture.run(&[command, "--compact"]);
+        assert!(!output.status.success(), "{command} accepted --compact");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if matches!(command, "version" | "help") {
+            assert!(
+                stderr.contains("accepts only --perf"),
+                "{command}: {stderr}"
+            );
+        } else {
+            assert!(stderr.contains("--compact"), "{command}: {stderr}");
+        }
+        assert_eq!(fixture.files(), before, "{command} changed project files");
+    }
+}
+
+#[test]
+fn sync_guides_scoped_edits_tracked_files_and_invalid_sources() {
+    let repo = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let git_config = config.path().join("gitconfig");
+    fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
+    fs::create_dir(repo.path().join("frontend")).unwrap();
+    let rule = repo.path().join(".agents/rules/frontend.md");
+    fs::write(&rule, "---\npath: frontend\n---\nScoped instruction.\n").unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .env("GIT_CONFIG_GLOBAL", &git_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rai"))
+            .arg("sync")
+            .args(args)
+            .arg("--repo")
+            .arg(repo.path())
+            .env("GIT_CONFIG_GLOBAL", &git_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("XDG_CACHE_HOME", config.path())
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["--json"]).status.success());
+    let generated = repo.path().join("frontend/AGENTS.md");
+    let original = fs::read_to_string(&generated).unwrap();
+    let edited = format!("{}Local addition.\n", original.split_once('\n').unwrap().1);
+    fs::write(&generated, &edited).unwrap();
+    let output = run(&["--dry-run"]);
+    assert!(!output.status.success());
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains(".agents/rules/ with path: frontend"),
+        "{report}"
+    );
+    assert_eq!(fs::read_to_string(&generated).unwrap(), edited);
+    fs::write(&generated, &original).unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["add", "-f", "--", "frontend/AGENTS.md"])
+            .env("GIT_CONFIG_GLOBAL", &git_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let output = run(&["--dry-run"]);
+    assert!(!output.status.success());
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains("rm --cached -- 'frontend/AGENTS.md'"),
+        "{report}"
+    );
+    assert!(report.contains("keeps the local file"), "{report}");
+    assert!(!report.contains("local ↔ expected:"), "{report}");
+    assert_eq!(fs::read_to_string(&generated).unwrap(), original);
+    let tracked = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["ls-files", "--error-unmatch", "--", "frontend/AGENTS.md"])
+        .env("GIT_CONFIG_GLOBAL", &git_config)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(tracked.status.success());
+    fs::write(
+        &rule,
+        "---\nname: invalid.md\n---\nKeep this invalid source.\n",
+    )
+    .unwrap();
+    let output = run(&[]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("Solution: Set the rule's name to its original instruction filename"),
+        "{error}"
+    );
+    assert!(error.contains("rai doctor --repo"), "{error}");
+    assert_eq!(fs::read_to_string(&generated).unwrap(), original);
+    #[cfg(unix)]
+    {
+        fs::write(&rule, "---\npath: frontend\n---\nScoped instruction.\n").unwrap();
+        let outside = config.path().join("outside.toml");
+        fs::write(&outside, "Keep this link target.\n").unwrap();
+        let projection = repo.path().join(".codex/config.toml");
+        fs::remove_file(&projection).unwrap();
+        std::os::unix::fs::symlink(&outside, &projection).unwrap();
+        let output = run(&["--dry-run"]);
+        assert!(!output.status.success());
+        let report = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            report.contains("Solution: inspect the target of '.codex/config.toml'"),
+            "{report}"
+        );
+        assert!(
+            report.contains("preserving the target contents"),
+            "{report}"
+        );
+        assert_eq!(
+            fs::read_to_string(&outside).unwrap(),
+            "Keep this link target.\n"
+        );
+        assert!(projection.is_symlink());
+    }
+}
+
+#[test]
+fn sync_resynchronizes_edited_projections_after_verified_external_backups() {
+    let repo = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
+    fs::create_dir(repo.path().join("frontend")).unwrap();
+    fs::write(
+        repo.path().join(".agents/rules/general.md"),
+        "Global rule.\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.path().join(".agents/rules/front.md"),
+        "---\npath: frontend\n---\nFrontend rule.\n",
+    )
+    .unwrap();
+    let run = |options: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_rai"))
+            .arg("sync")
+            .args(options)
+            .arg("--repo")
+            .arg(repo.path())
+            .env("XDG_CONFIG_HOME", config.path())
+            .env("APPDATA", config.path())
+            .env("XDG_CACHE_HOME", config.path())
+            .output()
+            .unwrap()
+    };
+    assert!(run(&["--json"]).status.success());
+    let paths = [
+        "AGENTS.md",
+        "frontend/AGENTS.md",
+        ".codex/config.toml",
+        ".github/copilot-instructions.md",
+        ".claude/settings.json",
+    ];
+    let originals: Vec<_> = paths
+        .iter()
+        .map(|path| fs::read_to_string(repo.path().join(path)).unwrap())
+        .collect();
+    let edits: Vec<_> = paths
+        .iter()
+        .zip(&originals)
+        .map(|(path, original)| {
+            let edited = if path.ends_with(".json") {
+                let mut json: serde_json::Value = serde_json::from_str(original).unwrap();
+                json["local_edit"] = true.into();
+                serde_json::to_string_pretty(&json).unwrap()
+            } else {
+                format!("{original}Local edit.\n")
+            };
+            fs::write(repo.path().join(path), &edited).unwrap();
+            edited
+        })
+        .collect();
+    let preview = run(&["--dry-run", "--json"]);
+    assert!(
+        preview.status.success(),
+        "{}",
+        String::from_utf8_lossy(&preview.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&preview.stdout).unwrap();
+    let backups: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let change = json["changes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["path"] == *path)
+                .unwrap();
+            assert_eq!(change["action"], "update");
+            std::path::PathBuf::from(change["backup"].as_str().unwrap())
+        })
+        .collect();
+    for ((path, edited), backup) in paths.iter().zip(&edits).zip(&backups) {
+        assert_eq!(fs::read_to_string(repo.path().join(path)).unwrap(), *edited);
+        assert!(!backup.exists());
+        assert!(!backup.starts_with(repo.path()));
+    }
+    let preview = run(&["--dry-run"]);
+    let report = String::from_utf8_lossy(&preview.stdout);
+    assert!(preview.status.success());
+    assert!(
+        report.contains("will back up and resynchronize"),
+        "{report}"
+    );
+    assert!(report.contains("Author unknown"), "{report}");
+    // A backup failure must prevent all repository writes, including healthy outputs.
+    fs::create_dir_all(backups[0].parent().unwrap()).unwrap();
+    fs::write(&backups[0], "different saved content").unwrap();
+    fs::write(
+        repo.path().join(".agents/rules/general.md"),
+        "Changed global rule.\n",
+    )
+    .unwrap();
+    let healthy = fs::read(repo.path().join("CLAUDE.md")).unwrap();
+    let failure = run(&["--json"]);
+    assert!(!failure.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&failure.stdout).unwrap();
+    assert_eq!(json["ok"], false);
+    assert!(json["error"].as_str().unwrap().contains("backup conflict"));
+    assert_eq!(fs::read(repo.path().join("CLAUDE.md")).unwrap(), healthy);
+    for (path, edited) in paths.iter().zip(&edits) {
+        assert_eq!(fs::read_to_string(repo.path().join(path)).unwrap(), *edited);
+    }
+    fs::remove_file(&backups[0]).unwrap();
+    let applied = run(&[]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let report = String::from_utf8_lossy(&applied.stdout);
+    assert!(report.contains("Synchronization complete"), "{report}");
+    assert_eq!(report.matches("Backup saved:").count(), paths.len());
+    assert!(report.contains("before sync · local ↔ expected:"));
+    for ((path, edited), backup) in paths.iter().zip(&edits).zip(&backups) {
+        assert_eq!(fs::read_to_string(backup).unwrap(), *edited);
+        assert!(
+            !fs::read_to_string(repo.path().join(path))
+                .unwrap()
+                .contains("Local edit.")
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(repo.path().join("frontend/AGENTS.md")).unwrap(),
+        originals[1]
+    );
+    assert!(
+        !fs::read_to_string(repo.path().join("AGENTS.md"))
+            .unwrap()
+            .contains("Frontend rule.")
+    );
+    let again = run(&["--git-hook"]);
+    assert!(again.status.success());
+    let report = String::from_utf8_lossy(&again.stdout);
+    assert!(report.contains("Everything is synchronized"));
+    assert!(!report.contains("Backup saved:"));
+}
+
+#[test]
+fn projection_hooks_block_direct_edits_and_allow_canonical_edits() {
+    let repo = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repo.path().join(".agents/rules")).unwrap();
+    fs::create_dir(repo.path().join("frontend")).unwrap();
+    fs::write(repo.path().join(".agents/rules/general.md"), "Global.\n").unwrap();
+    fs::write(
+        repo.path().join(".agents/rules/front.md"),
+        "---\npath: frontend\n---\nFront.\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["sync", "--repo"])
+        .arg(repo.path())
+        .env("XDG_CACHE_HOME", repo.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let config: toml::Value = fs::read_to_string(repo.path().join(".codex/config.toml"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        config["hooks"]["PreToolUse"][0]["hooks"][0]["command"].as_str(),
+        Some("rai guard")
+    );
+    let config: serde_json::Value =
+        serde_json::from_slice(&fs::read(repo.path().join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        config["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+        "rai guard"
+    );
+    let original = fs::read(repo.path().join("AGENTS.md")).unwrap();
+    let guard = |tool: &str, input: serde_json::Value| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
+            .arg("guard")
+            .env("XDG_CONFIG_HOME", repo.path().join("config"))
+            .env("PATH", "")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event = serde_json::json!({"hook_event_name": "PreToolUse", "cwd": repo.path(), "tool_name": tool, "tool_input": input});
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.to_string().as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    for (tool, input) in [
+        (
+            "Write",
+            serde_json::json!({"file_path": "AGENTS.md", "content": "edit"}),
+        ),
+        (
+            "Edit",
+            serde_json::json!({"file_path": "frontend/../AGENTS.md"}),
+        ),
+        (
+            "MultiEdit",
+            serde_json::json!({"file_path": "frontend/AGENTS.md"}),
+        ),
+        (
+            "apply_patch",
+            serde_json::json!({"input": "*** Begin Patch\n*** Delete File: AGENTS.md\n*** End Patch"}),
+        ),
+        (
+            "apply_patch",
+            serde_json::json!(
+                "*** Begin Patch\n*** Update File: main.rs\n*** Move to: AGENTS.md\n*** End Patch"
+            ),
+        ),
+    ] {
+        let decision = guard(tool, input);
+        assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert!(
+            decision["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains(".agents/rules/")
+        );
+    }
+    for path in [
+        ".agents/rules/general.md",
+        ".agents/agents/reviewer.md",
+        "src/main.rs",
+        "unmanaged/AGENTS.md",
+    ] {
+        assert_eq!(
+            guard("Write", serde_json::json!({"file_path": path})),
+            serde_json::json!({})
+        );
+    }
+    // Shell commands aren't treated as file edits: this is a tool guard, not a sandbox.
+    assert_eq!(
+        guard("Bash", serde_json::json!({"command": "cat AGENTS.md"})),
+        serde_json::json!({})
+    );
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(repo.path().join("AGENTS.md"), repo.path().join("alias.md"))
+            .unwrap();
+        assert_eq!(
+            guard("Write", serde_json::json!({"file_path": "alias.md"}))["hookSpecificOutput"]["permissionDecision"],
+            "deny"
+        );
+    }
+    assert_eq!(fs::read(repo.path().join("AGENTS.md")).unwrap(), original);
 }
 
 #[test]
@@ -1352,4 +2529,350 @@ fn doctor_recovers_moved_workspace_and_warns_when_it_disappears() {
         })
         .unwrap();
     assert_eq!(missing["autoFixable"], false);
+}
+
+#[test]
+fn mistyped_command_suggests_without_running_when_noninteractive() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["syn", "--repo"])
+        .arg(dir.path())
+        .env("PATH", "")
+        .env("XDG_CACHE_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Did you mean `rai sync`?"));
+    assert!(!stderr.contains("[y/N]"));
+    assert!(output.stdout.is_empty());
+    assert!(!dir.path().join(".agents").exists());
+}
+
+fn command_transcripts(
+    root: &std::path::Path,
+) -> Vec<(std::path::PathBuf, Vec<serde_json::Value>)> {
+    let mut logs = Vec::new();
+    if !root.is_dir() {
+        return logs;
+    }
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            logs.extend(command_transcripts(&path));
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        {
+            let contents = fs::read_to_string(&path).unwrap();
+            let events = contents
+                .rsplit_once('\n')
+                .map_or("", |(complete, _)| complete)
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            logs.push((path, events));
+        }
+    }
+    logs
+}
+
+fn transcript_output(events: &[serde_json::Value], stream: &str) -> String {
+    events
+        .iter()
+        .filter(|event| event["event"] == "output" && event["stream"] == stream)
+        .map(|event| event["text"].as_str().unwrap())
+        .collect()
+}
+
+#[test]
+fn command_logs_preserve_results_and_separate_projects_with_identical_names() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let config = sandbox.path().join("config");
+    let mut directories = std::collections::HashSet::new();
+    for parent in ["one", "two"] {
+        let repo = sandbox.path().join(parent).join("project");
+        fs::create_dir_all(repo.join(".agents/rules")).unwrap();
+        fs::write(repo.join(".agents/rules/general.md"), "Shared rule.\n").unwrap();
+        let before = command_transcripts(&config.join("rai/logs")).len();
+        for args in [
+            vec!["sync", "--json", "--perf"],
+            vec!["sync", "--json"],
+            vec!["status", "--invalid"],
+        ] {
+            let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+                .args(&args)
+                .arg("--repo")
+                .arg(&repo)
+                .env("HOME", sandbox.path())
+                .env("XDG_CONFIG_HOME", &config)
+                .env("XDG_CACHE_HOME", sandbox.path().join("cache"))
+                .env("APPDATA", &config)
+                .output()
+                .unwrap();
+            let logs_root = config.join("rai/logs");
+            let logs = command_transcripts(&logs_root);
+            let (_, events) = logs
+                .iter()
+                .find(|(_, events)| {
+                    events[0]["args"][0] == args[0]
+                        && events[0]["args"][1] == args[1]
+                        && events[0]["project"]
+                            == repo.canonicalize().unwrap().to_string_lossy().as_ref()
+                        && (args.len() == 3 || events[0]["args"].as_array().unwrap().len() == 4)
+                })
+                .unwrap();
+            assert_eq!(
+                transcript_output(events, "stdout").as_bytes(),
+                output.stdout
+            );
+            assert_eq!(
+                transcript_output(events, "stderr").as_bytes(),
+                output.stderr
+            );
+            assert_eq!(events[0]["event"], "start");
+            assert_eq!(events.last().unwrap()["event"], "finish");
+            assert_eq!(
+                events.last().unwrap()["exitCode"],
+                output.status.code().unwrap()
+            );
+            assert!(events.last().unwrap()["durationMs"].as_f64().unwrap() >= 0.0);
+            if !output.status.success() {
+                assert!(
+                    events.last().unwrap()["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("unknown option"),
+                    "{}",
+                    events.last().unwrap()["error"]
+                );
+            }
+        }
+        let logs = command_transcripts(&config.join("rai/logs"));
+        assert_eq!(logs.len(), before + 3);
+        let directory = logs
+            .iter()
+            .find(|(_, events)| {
+                events[0]["project"] == repo.canonicalize().unwrap().to_string_lossy().as_ref()
+            })
+            .unwrap()
+            .0
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        directories.insert(directory);
+        assert!(!repo.join("logs").exists());
+        assert_eq!(
+            fs::read_to_string(repo.join(".agents/rules/general.md")).unwrap(),
+            "Shared rule.\n"
+        );
+    }
+    assert_eq!(directories.len(), 2);
+}
+
+#[test]
+fn global_command_logs_survive_concurrent_invocations() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let mut children = Vec::new();
+    for _ in 0..8 {
+        children.push(
+            Command::new(env!("CARGO_BIN_EXE_rai"))
+                .arg("version")
+                .env("HOME", sandbox.path())
+                .env("APPDATA", sandbox.path())
+                .env_remove("XDG_CONFIG_HOME")
+                .env("PATH", "")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for child in children {
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success());
+        assert!(output.stderr.is_empty());
+    }
+    let root = if cfg!(windows) {
+        sandbox.path().join("rai/logs/global")
+    } else {
+        sandbox.path().join(".rai/logs/global")
+    };
+    let logs = command_transcripts(&root);
+    assert_eq!(logs.len(), 8);
+    for (_, events) in &logs {
+        assert_eq!(events[0]["args"], serde_json::json!(["version"]));
+        assert!(events[0]["project"].is_null());
+        assert!(transcript_output(events, "stdout").starts_with("rai "));
+        assert_eq!(events.last().unwrap()["exitCode"], 0);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for (path, _) in &logs {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn command_logging_failure_does_not_change_json_or_command_success() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let repo = sandbox.path().join("repo");
+    fs::create_dir_all(repo.join(".agents/rules")).unwrap();
+    let config = sandbox.path().join("config");
+    fs::create_dir_all(config.join("rai")).unwrap();
+    fs::write(config.join("rai/logs"), "Keep this file.\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .args(["status", "--json", "--repo"])
+        .arg(&repo)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("APPDATA", &config)
+        .env("HOME", sandbox.path())
+        .env("XDG_CACHE_HOME", sandbox.path().join("cache"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()["ok"],
+        true
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cannot create command log"));
+    assert_eq!(
+        fs::read_to_string(config.join("rai/logs")).unwrap(),
+        "Keep this file.\n"
+    );
+}
+
+#[test]
+fn watcher_logs_each_discovered_project_and_failure_separately() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let workspace = sandbox.path().join("workspace");
+    let good = workspace.join("good");
+    let bad = workspace.join("bad");
+    for repo in [&good, &bad] {
+        fs::create_dir_all(repo.join(".agents/rules")).unwrap();
+    }
+    fs::write(good.join(".agents/rules/general.md"), "Watch rule.\n").unwrap();
+    fs::write(
+        bad.join(".agents/rules/general.md"),
+        "---\nname: invalid\n---\nRule.\n",
+    )
+    .unwrap();
+    let config = sandbox.path().join("config");
+    fs::create_dir_all(config.join("rai")).unwrap();
+    fs::write(
+        config.join("rai/roots.txt"),
+        format!("{}\n", workspace.display()),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
+        .arg("watch")
+        .env("HOME", sandbox.path())
+        .env("XDG_CONFIG_HOME", &config)
+        .env("APPDATA", &config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    let complete = loop {
+        let logs = command_transcripts(&config.join("rai/logs/projects"));
+        if logs.len() == 2
+            && logs.iter().all(|(_, events)| {
+                events
+                    .last()
+                    .is_some_and(|event| event["event"] == "finish")
+            })
+        {
+            break true;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(10) {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(complete, "watcher did not finish its first scan");
+    let logs = command_transcripts(&config.join("rai/logs/projects"));
+    for (_, events) in logs {
+        assert_eq!(events[0]["source"], "watcher");
+        assert!(events[0]["parent"].as_str().unwrap().contains("global"));
+        let failed = events[0]["project"] == bad.canonicalize().unwrap().to_string_lossy().as_ref();
+        assert_eq!(
+            events.last().unwrap()["exitCode"],
+            if failed { 1 } else { 0 }
+        );
+        if failed {
+            assert!(transcript_output(&events, "stderr").contains("unsupported rule name"));
+        } else {
+            assert!(transcript_output(&events, "stdout").contains("Synchronization complete"));
+        }
+    }
+}
+
+#[test]
+fn command_logs_use_the_project_root_from_a_subdirectory() {
+    let sandbox = tempfile::tempdir().unwrap();
+    let repo = sandbox.path().join("project");
+    fs::create_dir_all(repo.join(".agents/rules")).unwrap();
+    fs::create_dir(repo.join("frontend")).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "--template=", "-q"])
+            .arg(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let config = sandbox.path().join("config");
+    let mut locations = vec![repo.clone(), repo.join("frontend")];
+    #[cfg(unix)]
+    {
+        let alias = sandbox.path().join("alias");
+        std::os::unix::fs::symlink(&repo, &alias).unwrap();
+        locations.push(alias);
+    }
+    for location in &locations {
+        let output = Command::new(env!("CARGO_BIN_EXE_rai"))
+            .args(["status", "--json"])
+            .current_dir(location)
+            .env("HOME", sandbox.path())
+            .env("XDG_CONFIG_HOME", &config)
+            .env("APPDATA", &config)
+            .env("XDG_CACHE_HOME", sandbox.path().join("cache"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let logs = command_transcripts(&config.join("rai/logs/projects"));
+    assert_eq!(logs.len(), locations.len());
+    let directories: std::collections::HashSet<_> = logs
+        .iter()
+        .map(|(path, events)| {
+            assert_eq!(
+                events[0]["project"],
+                repo.canonicalize().unwrap().to_string_lossy().as_ref()
+            );
+            path.parent().unwrap()
+        })
+        .collect();
+    assert_eq!(directories.len(), 1);
+    assert!(!repo.join("AGENTS.md").exists());
 }
