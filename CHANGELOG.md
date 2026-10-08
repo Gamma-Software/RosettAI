@@ -4,6 +4,16 @@ Notable changes to the `rai` CLI are recorded here.
 
 ## Unreleased
 
+## 0.4.2 - 2026-10-08
+
+### Fixed
+
+- Isolate Windows integration-test configuration and migration backups, preserve
+  LF fixture contents, and compare native JSON paths portably.
+- Add a checks-only release workflow mode to validate all five platforms on
+  `main` before tagging. The v0.4.0 and v0.4.1 workflows stopped before publishing
+  archives; v0.4.2 includes all changes listed below.
+
 ## 0.4.1 - 2026-10-08
 
 ### Fixed

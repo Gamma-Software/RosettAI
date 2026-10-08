@@ -1,0 +1,2 @@
+# Integration fixtures have byte-exact assertions and ownership digests.
+tests/integration/fixtures/** text eol=lf

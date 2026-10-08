@@ -25,6 +25,11 @@ impl Case {
                 .join(name);
             copy_tree(&source, &repo);
         }
+        fs::write(
+            home.path().join("gitconfig"),
+            "[core]\n    autocrlf = false\n",
+        )
+        .unwrap();
         Self { home, repo }
     }
 
@@ -33,13 +38,11 @@ impl Case {
     }
 
     fn run_at(&self, repo: &Path, args: &[&str], answer: &str) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_rai"))
+        let mut child = self
+            .command(env!("CARGO_BIN_EXE_rai"))
             .args(args)
             .arg("--repo")
             .arg(repo)
-            .env("HOME", self.home.path())
-            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
-            .env("GIT_CONFIG_GLOBAL", self.home.path().join("gitconfig"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -54,12 +57,32 @@ impl Case {
         child.wait_with_output().unwrap()
     }
 
+    fn command(&self, program: &str) -> Command {
+        let mut command = Command::new(program);
+        command
+            .env("HOME", self.home.path())
+            .env("APPDATA", self.home.path())
+            .env("XDG_CONFIG_HOME", self.home.path().join("config"))
+            .env("XDG_CACHE_HOME", self.home.path().join("cache"))
+            .env("GIT_CONFIG_GLOBAL", self.home.path().join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        command
+    }
+
     fn read(&self, relative: &str) -> String {
         fs::read_to_string(self.repo.join(relative)).unwrap()
     }
 
+    fn migration_root(&self) -> PathBuf {
+        self.home.path().join(if cfg!(windows) {
+            "rai/migrations"
+        } else {
+            ".rai/migrations"
+        })
+    }
+
     fn backup(&self) -> PathBuf {
-        let migrations = self.home.path().join(".rai/migrations/project");
+        let migrations = self.migration_root().join("project");
         let backups = fs::read_dir(migrations)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -82,8 +105,22 @@ fn copy_tree(source: &Path, destination: &Path) {
     }
 }
 
+fn display_paths(text: &str) -> String {
+    if cfg!(windows) {
+        text.replace('\\', "/")
+    } else {
+        text.to_owned()
+    }
+}
+
 fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Keep JSON escapes and values intact; normalize only terminal diagnostics.
+    if text.trim_start().starts_with('{') {
+        text.into_owned()
+    } else {
+        display_paths(&text)
+    }
 }
 
 #[test]
@@ -184,7 +221,7 @@ fn nested_migration_decline_and_hooks_preserve_sources() {
             case.read("src/AGENTS.md"),
             "Source directory instructions.\n"
         );
-        assert!(!case.home.path().join(".rai/migrations").exists());
+        assert!(!case.migration_root().exists());
         assert!(!case.repo.join(".codex/config.toml").exists());
     }
 }
@@ -210,7 +247,7 @@ fn sync_migrates_new_nested_instructions_after_a_previous_migration() {
             .contains("New local instructions.")
     );
     assert_eq!(
-        fs::read_dir(case.home.path().join(".rai/migrations/project"))
+        fs::read_dir(case.migration_root().join("project"))
             .unwrap()
             .count(),
         2
@@ -246,7 +283,7 @@ fn recursive_detection_stops_at_fixture_dependency_and_project_boundaries() {
     let result = case.run(&["sync"], "");
     assert!(result.status.success(), "{}", stderr(&result));
     assert!(!stdout(&result).contains("Migration proposed"));
-    assert!(!case.home.path().join(".rai/migrations").exists());
+    assert!(!case.migration_root().exists());
 }
 
 #[test]
@@ -259,7 +296,7 @@ fn tracked_nested_migration_can_resume_a_missing_scoped_rule() {
     )
     .unwrap();
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("init")
             .arg(&case.repo)
             .output()
@@ -268,7 +305,7 @@ fn tracked_nested_migration_can_resume_a_missing_scoped_rule() {
             .success()
     );
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("-C")
             .arg(&case.repo)
             .args(["add", "src/AGENTS.md"])
@@ -295,7 +332,8 @@ fn tracked_nested_migration_can_resume_a_missing_scoped_rule() {
         case.read("src/AGENTS.md")
             .contains("Tracked source instructions.")
     );
-    let files = Command::new("git")
+    let files = case
+        .command("git")
         .arg("-C")
         .arg(&case.repo)
         .args(["ls-files", "src/AGENTS.md"])
@@ -313,7 +351,7 @@ fn nested_source_with_different_staged_content_blocks_before_any_write() {
     fs::create_dir(case.repo.join("src")).unwrap();
     fs::write(case.repo.join("src/AGENTS.md"), "Staged instructions.\n").unwrap();
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("init")
             .arg(&case.repo)
             .output()
@@ -322,7 +360,7 @@ fn nested_source_with_different_staged_content_blocks_before_any_write() {
             .success()
     );
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("-C")
             .arg(&case.repo)
             .args(["add", "src/AGENTS.md"])
@@ -337,7 +375,7 @@ fn nested_source_with_different_staged_content_blocks_before_any_write() {
     assert!(stderr(&result).contains("staged migration source changed: src/AGENTS.md"));
     assert_eq!(case.read("src/AGENTS.md"), "Working instructions.\n");
     assert!(!case.repo.join(".agents").exists());
-    assert!(!case.home.path().join(".rai/migrations").exists());
+    assert!(!case.migration_root().exists());
 }
 
 #[test]
@@ -359,7 +397,7 @@ fn ambiguous_scoped_rule_names_block_before_migration() {
                 .contains("migration destination conflict: .agents/rules/AGENTS-src-a-b.md")
         );
         assert!(!case.repo.join(".agents").exists());
-        assert!(!case.home.path().join(".rai/migrations").exists());
+        assert!(!case.migration_root().exists());
         for directory in directories {
             assert_eq!(
                 case.read(&format!("{directory}/AGENTS.md")),
@@ -391,11 +429,11 @@ fn scoped_migration_preserves_an_existing_rule_with_the_requested_name() {
         case.read("src/AGENTS.md"),
         "Source directory instructions.\n"
     );
-    assert!(!case.home.path().join(".rai/migrations").exists());
+    assert!(!case.migration_root().exists());
 }
 
 fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
+    display_paths(&String::from_utf8_lossy(&output.stderr))
 }
 
 #[test]
@@ -513,7 +551,7 @@ fn invalid_rule_metadata_fails_before_any_projection_is_written() {
 fn unsupported_rule_name_is_reported_without_changing_existing_projections() {
     let case = Case::new(Some("invalid-rule-name"));
     assert!(
-        Command::new("git")
+        case.command("git")
             .args(["init", "-q"])
             .current_dir(&case.repo)
             .status()
@@ -546,7 +584,19 @@ fn unsupported_rule_name_is_reported_without_changing_existing_projections() {
         vec!["sync", "--codex-hook"],
     ] {
         let result = case.run(&args, "");
-        let diagnostic = format!("{}{}", stdout(&result), stderr(&result));
+        let output = stdout(&result);
+        let json: Option<serde_json::Value> = serde_json::from_str(&output).ok();
+        let message = json.as_ref().and_then(|value| {
+            value["error"]
+                .as_str()
+                .or_else(|| value["reason"].as_str())
+                .or_else(|| value["issues"][0]["message"].as_str())
+        });
+        let diagnostic = display_paths(&format!(
+            "{}{}",
+            message.unwrap_or(&output),
+            stderr(&result)
+        ));
         assert!(
             diagnostic.contains("unsupported rule name: repository.md"),
             "{args:?}: {diagnostic}"
@@ -593,7 +643,7 @@ fn invalid_existing_rule_blocks_before_importing_new_native_instructions() {
     );
     assert!(!case.repo.join(".agents/rules/AGENTS-src.md").exists());
     assert!(!case.repo.join("AGENTS.md").exists());
-    assert!(!case.home.path().join(".rai/migrations").exists());
+    assert!(!case.migration_root().exists());
 }
 
 #[test]
@@ -602,7 +652,7 @@ fn resuming_an_unsupported_recorded_rule_does_not_remove_its_tracked_source() {
     fs::create_dir(case.repo.join("src")).unwrap();
     fs::write(case.repo.join("src/AGENTS.md"), "Tracked instructions.\n").unwrap();
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("init")
             .arg(&case.repo)
             .output()
@@ -611,7 +661,7 @@ fn resuming_an_unsupported_recorded_rule_does_not_remove_its_tracked_source() {
             .success()
     );
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("-C")
             .arg(&case.repo)
             .args(["add", "src/AGENTS.md"])
@@ -640,7 +690,8 @@ fn resuming_an_unsupported_recorded_rule_does_not_remove_its_tracked_source() {
     assert!(stderr(&result).contains("unsupported rule name: repository.md"));
     assert_eq!(case.read("src/AGENTS.md"), "Tracked instructions.\n");
     assert!(!case.repo.join(rule).exists());
-    let tracked = Command::new("git")
+    let tracked = case
+        .command("git")
         .arg("-C")
         .arg(&case.repo)
         .args(["ls-files", "src/AGENTS.md"])
@@ -659,7 +710,7 @@ fn recorded_migrations_without_name_metadata_still_resume() {
         fs::create_dir_all(case.repo.join(relative).parent().unwrap()).unwrap();
         fs::write(case.repo.join(relative), "Legacy instructions.\n").unwrap();
         assert!(
-            Command::new("git")
+            case.command("git")
                 .arg("init")
                 .arg(&case.repo)
                 .output()
@@ -668,7 +719,7 @@ fn recorded_migrations_without_name_metadata_still_resume() {
                 .success()
         );
         assert!(
-            Command::new("git")
+            case.command("git")
                 .arg("-C")
                 .arg(&case.repo)
                 .args(["add", relative])
@@ -781,7 +832,7 @@ fn sync_cleans_populated_canonical_directories_and_previews_without_writes() {
         fs::write(case.repo.join(".agents/extra/assets/icon.svg"), "<svg/>\n").unwrap();
         // Canonical placeholders can be Git-tracked; cleanup must leave the index alone.
         assert!(
-            Command::new("git")
+            case.command("git")
                 .args(["init", "-q"])
                 .current_dir(&case.repo)
                 .status()
@@ -789,7 +840,7 @@ fn sync_cleans_populated_canonical_directories_and_previews_without_writes() {
                 .success()
         );
         assert!(
-            Command::new("git")
+            case.command("git")
                 .args(["add", ".agents"])
                 .current_dir(&case.repo)
                 .status()
@@ -806,13 +857,12 @@ fn sync_cleans_populated_canonical_directories_and_previews_without_writes() {
             assert!(preview.status.success(), "{}", stderr(&preview));
             let value: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
             for path in removed {
-                assert!(
-                    value["changes"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|change| change["path"] == path && change["action"] == "delete")
-                );
+                assert!(value["changes"].as_array().unwrap().iter().any(|change| {
+                    change["path"]
+                        .as_str()
+                        .is_some_and(|reported| Path::new(reported) == Path::new(path))
+                        && change["action"] == "delete"
+                }));
                 assert!(case.repo.join(path).is_file());
             }
             assert!(!case.repo.join("AGENTS.md").exists());
@@ -982,7 +1032,8 @@ fn unsupported_native_sources_block_before_writing() {
 fn tracked_native_source_migrates_and_projects_after_approval() {
     let tracked = Case::new(Some("native"));
     assert!(
-        Command::new("git")
+        tracked
+            .command("git")
             .arg("init")
             .arg(&tracked.repo)
             .output()
@@ -991,7 +1042,8 @@ fn tracked_native_source_migrates_and_projects_after_approval() {
             .success()
     );
     assert!(
-        Command::new("git")
+        tracked
+            .command("git")
             .arg("-C")
             .arg(&tracked.repo)
             .args(["add", "AGENTS.md"])
@@ -1001,7 +1053,8 @@ fn tracked_native_source_migrates_and_projects_after_approval() {
             .success()
     );
     assert!(
-        Command::new("git")
+        tracked
+            .command("git")
             .arg("-C")
             .arg(&tracked.repo)
             .args([
@@ -1036,7 +1089,7 @@ fn tracked_native_source_migrates_and_projects_after_approval() {
     assert!(preview.contains("Remove AGENTS.md from Git before generating its projection"));
     assert!(preview.contains("Rollback this migration with `rai rollback`"));
     assert!(!preview.contains("manifest.json"));
-    assert!(!preview.contains(&tracked.backup().display().to_string()));
+    assert!(!preview.contains(&display_paths(&tracked.backup().display().to_string())));
     assert!(
         tracked
             .read("AGENTS.md")
@@ -1053,7 +1106,8 @@ fn tracked_native_source_migrates_and_projects_after_approval() {
         "Keep the project instructions.\n"
     );
     assert!(tracked.repo.join(".codex/config.toml").exists());
-    let status = Command::new("git")
+    let status = tracked
+        .command("git")
         .arg("-C")
         .arg(&tracked.repo)
         .args(["diff", "--cached", "--name-only"])
@@ -1074,7 +1128,7 @@ fn tracked_native_source_migrates_and_projects_after_approval() {
 fn recorded_migration_restores_missing_rule_and_finishes() {
     let case = Case::new(Some("native"));
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("init")
             .arg(&case.repo)
             .output()
@@ -1083,7 +1137,7 @@ fn recorded_migration_restores_missing_rule_and_finishes() {
             .success()
     );
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("-C")
             .arg(&case.repo)
             .args(["add", "AGENTS.md"])
@@ -1116,7 +1170,7 @@ fn recorded_migration_restores_missing_rule_and_finishes() {
 fn rollback_of_approved_tracked_migration_keeps_original() {
     let case = Case::new(Some("native"));
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("init")
             .arg(&case.repo)
             .output()
@@ -1125,7 +1179,7 @@ fn rollback_of_approved_tracked_migration_keeps_original() {
             .success()
     );
     assert!(
-        Command::new("git")
+        case.command("git")
             .arg("-C")
             .arg(&case.repo)
             .args(["add", "AGENTS.md"])
@@ -1160,7 +1214,7 @@ fn rollback_can_read_a_previous_full_hash_backup() {
     assert!(case.run(&["sync"], "y\nn\n").status.success());
     let root = case.repo.canonicalize().unwrap();
     let previous_id = format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
-    let previous = case.home.path().join(".rai/migrations").join(previous_id);
+    let previous = case.migration_root().join(previous_id);
     fs::rename(case.backup(), &previous).unwrap();
     let rollback = case.run(&["rollback"], "");
     assert!(rollback.status.success(), "{}", stderr(&rollback));
@@ -1171,7 +1225,7 @@ fn rollback_can_read_a_previous_full_hash_backup() {
 fn rollback_can_read_a_previous_short_hash_backup() {
     let case = Case::new(Some("native"));
     assert!(case.run(&["sync"], "y\nn\n").status.success());
-    let previous = case.home.path().join(".rai/migrations/abcdef123456");
+    let previous = case.migration_root().join("abcdef123456");
     fs::rename(case.backup(), &previous).unwrap();
     let rollback = case.run(&["rollback"], "");
     assert!(rollback.status.success(), "{}", stderr(&rollback));
@@ -1183,9 +1237,7 @@ fn rollback_can_read_a_previous_flat_dated_backup() {
     let case = Case::new(Some("native"));
     assert!(case.run(&["sync"], "y\nn\n").status.success());
     let previous = case
-        .home
-        .path()
-        .join(".rai/migrations")
+        .migration_root()
         .join(case.backup().file_name().unwrap());
     fs::rename(case.backup(), &previous).unwrap();
     let rollback = case.run(&["rollback"], "");
@@ -1209,7 +1261,7 @@ fn two_projects_share_the_backup_root_without_overwriting_each_other() {
     assert!(case.run(&["sync"], "y\nn\n").status.success());
     let second = case.run_at(&other, &["sync"], "y\nn\n");
     assert!(second.status.success(), "{}", stderr(&second));
-    let backups = fs::read_dir(case.home.path().join(".rai/migrations/project"))
+    let backups = fs::read_dir(case.migration_root().join("project"))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -1439,7 +1491,7 @@ fn migration_previews_gitignore_and_rollback_restores_it() {
     for existing in [None, Some("/user-cache/\n")] {
         let case = Case::new(Some("native"));
         assert!(
-            Command::new("git")
+            case.command("git")
                 .args(["init", "-q"])
                 .current_dir(&case.repo)
                 .status()
