@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to rebuild
+        description: Existing release tag (or branch when running checks only)
         required: true
         type: string
+      checks_only:
+        description: Run platform checks without publishing a release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -22,6 +27,7 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref_name }}
       - name: Check tag matches Cargo version
+        if: inputs.checks_only != true
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
@@ -111,6 +117,7 @@ jobs:
 
   publish:
     needs: build
+    if: inputs.checks_only != true
     runs-on: ubuntu-latest
     permissions:
       contents: write

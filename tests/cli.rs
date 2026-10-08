@@ -372,6 +372,7 @@ fn help_and_noninteractive_default_show_english_guidance() {
 fn init_requires_migration_and_migrate_preserves_native_instructions() {
     let repo = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
+    let config = home.path().join("config");
     fs::write(repo.path().join("AGENTS.md"), "Keep existing rules.\n").unwrap();
     fs::create_dir_all(repo.path().join(".github")).unwrap();
     fs::write(
@@ -384,6 +385,8 @@ fn init_requires_migration_and_migrate_preserves_native_instructions() {
             .args([command, "--repo"])
             .arg(repo.path())
             .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", &config)
+            .env("APPDATA", &config)
             .env("GIT_CONFIG_GLOBAL", home.path().join("gitconfig"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -423,14 +426,14 @@ fn init_requires_migration_and_migrate_preserves_native_instructions() {
         fs::read_to_string(repo.path().join(".agents/mcp.yaml")).unwrap(),
         "servers: {}\n"
     );
-    let backups = fs::read_dir(
-        home.path()
-            .join(".rai/migrations")
-            .join(repo.path().file_name().unwrap()),
-    )
-    .unwrap()
-    .collect::<Result<Vec<_>, _>>()
-    .unwrap();
+    #[cfg(windows)]
+    let migration_base = config.join("rai/migrations");
+    #[cfg(not(windows))]
+    let migration_base = home.path().join(".rai/migrations");
+    let backups = fs::read_dir(migration_base.join(repo.path().file_name().unwrap()))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     assert_eq!(backups.len(), 1);
     let backup = backups[0].path();
     assert_eq!(
@@ -1804,12 +1807,17 @@ fn sync_resynchronizes_edited_projections_after_verified_external_backups() {
     let backups: Vec<_> = paths
         .iter()
         .map(|path| {
+            // JSON keeps native path separators, including backslashes on Windows.
             let change = json["changes"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .find(|c| c["path"] == *path)
-                .unwrap();
+                .find(|change| {
+                    change["path"].as_str().is_some_and(|reported| {
+                        std::path::Path::new(reported) == std::path::Path::new(path)
+                    })
+                })
+                .unwrap_or_else(|| panic!("missing update for {path}: {json}"));
             assert_eq!(change["action"], "update");
             std::path::PathBuf::from(change["backup"].as_str().unwrap())
         })
