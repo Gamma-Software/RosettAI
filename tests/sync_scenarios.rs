@@ -589,6 +589,7 @@ fn unsupported_rule_name_is_reported_without_changing_existing_projections() {
         let message = json.as_ref().and_then(|value| {
             value["error"]
                 .as_str()
+                .or_else(|| value["conflict"].as_str())
                 .or_else(|| value["reason"].as_str())
                 .or_else(|| value["issues"][0]["message"].as_str())
         });
@@ -601,7 +602,10 @@ fn unsupported_rule_name_is_reported_without_changing_existing_projections() {
             diagnostic.contains("unsupported rule name: repository.md"),
             "{args:?}: {diagnostic}"
         );
-        assert!(diagnostic.contains(".agents/rules/repository.md"));
+        assert!(
+            diagnostic.contains(".agents/rules/repository.md"),
+            "{args:?}: {diagnostic}"
+        );
         if args[0] == "doctor" {
             let json: serde_json::Value = serde_json::from_str(&stdout(&result)).unwrap();
             assert_eq!(json["ok"], false);
